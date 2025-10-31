@@ -46,4 +46,6 @@ temp/
 # Misc
 *.tgz
 *.tar.gz
+services/.mcp.json
+services/.claude-flow/
 
