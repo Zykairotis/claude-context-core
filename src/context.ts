@@ -18,6 +18,8 @@ import {
 } from './vectordb';
 import { SemanticSearchResult } from './types';
 import { envManager } from './utils/env-manager';
+import { getOrCreateProject, getOrCreateDataset } from './utils/project-helpers';
+import { Pool } from 'pg';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
@@ -94,6 +96,20 @@ export interface ContextConfig {
     ignorePatterns?: string[];
     customExtensions?: string[]; // New: custom extensions from MCP
     customIgnorePatterns?: string[]; // New: custom ignore patterns from MCP
+    postgresPool?: Pool; // Optional: for project-aware operations
+}
+
+export interface ProjectContext {
+    projectId: string;
+    projectName: string;
+    datasetId: string;
+    datasetName: string;
+}
+
+export interface ProvenanceInfo {
+    repo?: string;
+    branch?: string;
+    sha?: string;
 }
 
 export class Context {
@@ -103,8 +119,10 @@ export class Context {
     private supportedExtensions: string[];
     private ignorePatterns: string[];
     private synchronizers = new Map<string, FileSynchronizer>();
+    private postgresPool?: Pool;
 
     constructor(config: ContextConfig = {}) {
+        this.postgresPool = config.postgresPool;
         // Initialize services
         this.embedding = config.embedding || new OpenAIEmbedding({
             apiKey: envManager.get('OPENAI_API_KEY') || 'your-openai-api-key',
@@ -808,7 +826,12 @@ export class Context {
     /**
      * Process a batch of chunks
      */
-    private async processChunkBatch(chunks: CodeChunk[], codebasePath: string): Promise<void> {
+    private async processChunkBatch(
+        chunks: CodeChunk[], 
+        codebasePath: string,
+        projectContext?: ProjectContext,
+        provenance?: ProvenanceInfo
+    ): Promise<void> {
         const isHybrid = this.getIsHybrid();
 
         // Generate embedding vectors
@@ -825,6 +848,7 @@ export class Context {
                 const relativePath = path.relative(codebasePath, chunk.metadata.filePath);
                 const fileExtension = path.extname(chunk.metadata.filePath);
                 const { filePath, startLine, endLine, ...restMetadata } = chunk.metadata;
+                const lang = this.getLanguageFromExtension(fileExtension);
 
                 return {
                     id: this.generateId(relativePath, chunk.metadata.startLine || 0, chunk.metadata.endLine || 0, chunk.content),
@@ -834,6 +858,15 @@ export class Context {
                     startLine: chunk.metadata.startLine || 0,
                     endLine: chunk.metadata.endLine || 0,
                     fileExtension,
+                    // Project-aware fields
+                    projectId: projectContext?.projectId,
+                    datasetId: projectContext?.datasetId,
+                    sourceType: 'code',
+                    // Provenance fields
+                    repo: provenance?.repo,
+                    branch: provenance?.branch,
+                    sha: provenance?.sha,
+                    lang,
                     metadata: {
                         ...restMetadata,
                         codebasePath,
@@ -855,6 +888,7 @@ export class Context {
                 const relativePath = path.relative(codebasePath, chunk.metadata.filePath);
                 const fileExtension = path.extname(chunk.metadata.filePath);
                 const { filePath, startLine, endLine, ...restMetadata } = chunk.metadata;
+                const lang = this.getLanguageFromExtension(fileExtension);
 
                 return {
                     id: this.generateId(relativePath, chunk.metadata.startLine || 0, chunk.metadata.endLine || 0, chunk.content),
@@ -864,6 +898,15 @@ export class Context {
                     startLine: chunk.metadata.startLine || 0,
                     endLine: chunk.metadata.endLine || 0,
                     fileExtension,
+                    // Project-aware fields
+                    projectId: projectContext?.projectId,
+                    datasetId: projectContext?.datasetId,
+                    sourceType: 'code',
+                    // Provenance fields
+                    repo: provenance?.repo,
+                    branch: provenance?.branch,
+                    sha: provenance?.sha,
+                    lang,
                     metadata: {
                         ...restMetadata,
                         codebasePath,
@@ -1237,5 +1280,158 @@ export class Context {
                 reason: 'Using LangChain splitter directly'
             };
         }
+    }
+
+    /**
+     * Resolve project and dataset, creating them if they don't exist
+     * Requires postgresPool to be configured
+     */
+    private async resolveProject(
+        projectName: string,
+        datasetName: string
+    ): Promise<ProjectContext> {
+        if (!this.postgresPool) {
+            throw new Error('PostgreSQL pool not configured. Cannot resolve project context.');
+        }
+
+        const client = await this.postgresPool.connect();
+        try {
+            // Get or create project
+            const project = await getOrCreateProject(client, projectName);
+            
+            // Get or create dataset
+            const dataset = await getOrCreateDataset(client, project.id, datasetName);
+
+            return {
+                projectId: project.id,
+                projectName: project.name,
+                datasetId: dataset.id,
+                datasetName: dataset.name
+            };
+        } finally {
+            client.release();
+        }
+    }
+
+    /**
+     * Index a codebase with project awareness
+     * @param codebasePath Codebase root path
+     * @param projectName Project name
+     * @param datasetName Dataset name
+     * @param options Additional options including provenance info
+     * @param progressCallback Optional progress callback function
+     * @param forceReindex Whether to recreate the collection even if it exists
+     * @returns Indexing statistics
+     */
+    async indexWithProject(
+        codebasePath: string,
+        projectName: string,
+        datasetName: string,
+        options?: {
+            repo?: string;
+            branch?: string;
+            sha?: string;
+            progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void;
+            forceReindex?: boolean;
+        }
+    ): Promise<{ indexedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
+        console.log(`[Context] 🚀 Starting project-aware indexing for project: ${projectName}, dataset: ${datasetName}`);
+
+        // Resolve project context
+        const projectContext = await this.resolveProject(projectName, datasetName);
+        console.log(`[Context] ✅ Resolved project: ${projectContext.projectId}, dataset: ${projectContext.datasetId}`);
+
+        // Extract provenance info
+        const provenance: ProvenanceInfo = {
+            repo: options?.repo,
+            branch: options?.branch,
+            sha: options?.sha
+        };
+
+        // Use the existing indexCodebase logic but with project context
+        // We'll need to modify the processChunkBatch calls to include project context
+        // For now, call the existing method and note that processChunkBatch signature has changed
+        
+        const isHybrid = this.getIsHybrid();
+        const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
+        console.log(`[Context] 🚀 Starting to index codebase with ${searchType}: ${codebasePath}`);
+
+        // 1. Load ignore patterns from various ignore files
+        await this.loadIgnorePatterns(codebasePath);
+
+        // 2. Check and prepare vector collection
+        options?.progressCallback?.({ phase: 'Preparing collection...', current: 0, total: 100, percentage: 0 });
+        await this.prepareCollection(codebasePath, options?.forceReindex || false);
+
+        // 3. Recursively traverse codebase to get all supported files
+        options?.progressCallback?.({ phase: 'Scanning files...', current: 5, total: 100, percentage: 5 });
+        const codeFiles = await this.getCodeFiles(codebasePath);
+        console.log(`[Context] 📁 Found ${codeFiles.length} code files`);
+
+        if (codeFiles.length === 0) {
+            options?.progressCallback?.({ phase: 'No files to index', current: 100, total: 100, percentage: 100 });
+            return { indexedFiles: 0, totalChunks: 0, status: 'completed' };
+        }
+
+        // 4. Process files with project context
+        const indexingStartPercentage = 10;
+        const indexingEndPercentage = 100;
+        const indexingRange = indexingEndPercentage - indexingStartPercentage;
+
+        let processedFiles = 0;
+        let totalChunks = 0;
+        const chunkBatch: CodeChunk[] = [];
+        const BATCH_SIZE = 50;
+
+        for (const filePath of codeFiles) {
+            try {
+                const fileContent = await fs.promises.readFile(filePath, 'utf-8');
+                const language = this.getLanguageFromExtension(path.extname(filePath));
+                const chunks = await this.codeSplitter.split(fileContent, language, filePath);
+
+                for (const chunk of chunks) {
+                    chunkBatch.push(chunk);
+                    
+                    if (chunkBatch.length >= BATCH_SIZE) {
+                        await this.processChunkBatch(chunkBatch, codebasePath, projectContext, provenance);
+                        totalChunks += chunkBatch.length;
+                        chunkBatch.length = 0;
+                    }
+                }
+
+                processedFiles++;
+                const progressPercentage = indexingStartPercentage + (processedFiles / codeFiles.length) * indexingRange;
+                options?.progressCallback?.({
+                    phase: `Processing files (${processedFiles}/${codeFiles.length})...`,
+                    current: processedFiles,
+                    total: codeFiles.length,
+                    percentage: Math.round(progressPercentage)
+                });
+            } catch (error) {
+                console.error(`[Context] ❌ Error processing file ${filePath}:`, error);
+            }
+        }
+
+        // Process remaining chunks
+        if (chunkBatch.length > 0) {
+            await this.processChunkBatch(chunkBatch, codebasePath, projectContext, provenance);
+            totalChunks += chunkBatch.length;
+        }
+
+        console.log(`[Context] ✅ Project-aware indexing completed! Processed ${processedFiles} files, generated ${totalChunks} chunks`);
+        options?.progressCallback?.({ phase: 'Completed', current: 100, total: 100, percentage: 100 });
+
+        return {
+            indexedFiles: processedFiles,
+            totalChunks,
+            status: 'completed'
+        };
+    }
+
+    /**
+     * Check if the embedding provider is AutoEmbeddingMonster
+     */
+    isAutoEmbeddingMonster(): boolean {
+        return this.embedding.constructor.name === 'AutoEmbeddingMonster';
     }
 }

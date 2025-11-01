@@ -8,19 +8,9 @@ export {
     HybridSearchOptions,
     HybridSearchResult,
     RerankStrategy,
-    COLLECTION_LIMIT_MESSAGE
+    CollectionStats
 } from './types';
 
-// Implementation class exports
-export { MilvusRestfulVectorDatabase, MilvusRestfulConfig } from './milvus-restful-vectordb';
-export { MilvusVectorDatabase, MilvusConfig } from './milvus-vectordb';
-export {
-    ClusterManager,
-    ZillizConfig,
-    Project,
-    Cluster,
-    CreateFreeClusterRequest,
-    CreateFreeClusterResponse,
-    CreateFreeClusterWithDetailsResponse,
-    DescribeClusterResponse
-} from './zilliz-utils'; 
+// Re-export implementations
+export { PostgresDualVectorDatabase } from './postgres-dual-vectordb';
+export { QdrantVectorDatabase } from './qdrant-vectordb';

@@ -7,6 +7,23 @@ export interface VectorDocument {
     startLine: number;
     endLine: number;
     fileExtension: string;
+    
+    // Project-aware fields
+    projectId?: string;
+    datasetId?: string;
+    sourceType?: 'code' | 'web_page' | 'doc';
+    
+    // Code provenance
+    repo?: string;
+    branch?: string;
+    sha?: string;
+    lang?: string;
+    symbol?: Record<string, any>;
+    
+    // Dual vector support
+    summaryVector?: number[];
+    sparseVector?: Record<string, number>;
+    
     metadata: Record<string, any>;
 }
 
@@ -44,6 +61,11 @@ export interface VectorSearchResult {
 export interface HybridSearchResult {
     document: VectorDocument;
     score: number;
+}
+
+export interface CollectionStats {
+    entityCount: number;
+    dimension?: number;
 }
 
 export interface VectorDatabase {
@@ -131,6 +153,12 @@ export interface VectorDatabase {
      * Returns true if collection can be created, false if limit exceeded
      */
     checkCollectionLimit(): Promise<boolean>;
+
+    /**
+     * Get collection statistics
+     * @param collectionName Collection name
+     */
+    getCollectionStats(collectionName: string): Promise<CollectionStats | null>;
 }
 
 /**
