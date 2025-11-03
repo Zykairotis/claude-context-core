@@ -1,5 +1,5 @@
 import Parser from 'tree-sitter';
-import { Splitter, CodeChunk } from './index';
+import { Splitter, CodeChunk, SymbolMetadata } from './index';
 
 // Language parsers
 const JavaScript = require('tree-sitter-javascript');
@@ -25,15 +25,80 @@ const SPLITTABLE_NODE_TYPES = {
     scala: ['method_declaration', 'class_declaration', 'interface_declaration', 'constructor_declaration']
 };
 
+// Language-specific symbol extraction configuration
+const SYMBOL_EXTRACTORS: Record<string, { nameNode: string; paramNode: string; docNode: string }> = {
+    typescript: {
+        nameNode: 'identifier',
+        paramNode: 'formal_parameters',
+        docNode: 'comment'
+    },
+    javascript: {
+        nameNode: 'identifier',
+        paramNode: 'formal_parameters',
+        docNode: 'comment'
+    },
+    python: {
+        nameNode: 'identifier',
+        paramNode: 'parameters',
+        docNode: 'expression_statement'
+    },
+    java: {
+        nameNode: 'identifier',
+        paramNode: 'formal_parameters',
+        docNode: 'block_comment'
+    },
+    cpp: {
+        nameNode: 'identifier',
+        paramNode: 'parameter_list',
+        docNode: 'comment'
+    },
+    go: {
+        nameNode: 'identifier',
+        paramNode: 'parameter_list',
+        docNode: 'comment'
+    },
+    rust: {
+        nameNode: 'identifier',
+        paramNode: 'parameters',
+        docNode: 'line_comment'
+    }
+};
+
+// Map node types to symbol kinds
+const NODE_TYPE_TO_KIND: Record<string, SymbolMetadata['kind']> = {
+    'function_declaration': 'function',
+    'function_definition': 'function',
+    'function_item': 'function',
+    'arrow_function': 'function',
+    'method_declaration': 'method',
+    'method_definition': 'method',
+    'class_declaration': 'class',
+    'class_definition': 'class',
+    'class_specifier': 'class',
+    'interface_declaration': 'interface',
+    'type_alias_declaration': 'type',
+    'type_declaration': 'type',
+    'struct_item': 'struct',
+    'struct_declaration': 'struct',
+    'enum_item': 'enum',
+    'enum_declaration': 'enum',
+    'trait_item': 'trait',
+    'mod_item': 'module',
+    'namespace_definition': 'module',
+    'var_declaration': 'variable',
+    'const_declaration': 'const',
+    'constructor_declaration': 'method'
+};
+
 export class AstCodeSplitter implements Splitter {
-    private chunkSize: number = 2500;
-    private chunkOverlap: number = 300;
+    private chunkSize: number = 1000;
+    private chunkOverlap: number = 100;
     private parser: Parser;
     private langchainFallback: any; // LangChainCodeSplitter for fallback
 
     constructor(chunkSize?: number, chunkOverlap?: number) {
         if (chunkSize) this.chunkSize = chunkSize;
-        if (chunkOverlap) this.chunkOverlap = chunkOverlap;
+        if (chunkOverlap || chunkOverlap === 0) this.chunkOverlap = chunkOverlap;
         this.parser = new Parser();
 
         // Initialize fallback splitter
@@ -125,6 +190,9 @@ export class AstCodeSplitter implements Splitter {
 
                 // Only create chunk if it has meaningful content
                 if (nodeText.trim().length > 0) {
+                    const chunkTitle = this.getChunkTitle(nodeText, filePath);
+                    const symbol = this.extractSymbolMetadata(currentNode, language, code);
+                    
                     chunks.push({
                         content: nodeText,
                         metadata: {
@@ -132,6 +200,8 @@ export class AstCodeSplitter implements Splitter {
                             endLine,
                             language,
                             filePath,
+                            chunkTitle,
+                            symbol: symbol || undefined
                         }
                     });
                 }
@@ -147,6 +217,7 @@ export class AstCodeSplitter implements Splitter {
 
         // If no meaningful chunks found, create a single chunk with the entire code
         if (chunks.length === 0) {
+            const chunkTitle = this.getChunkTitle(code, filePath);
             chunks.push({
                 content: code,
                 metadata: {
@@ -154,6 +225,7 @@ export class AstCodeSplitter implements Splitter {
                     endLine: codeLines.length,
                     language,
                     filePath,
+                    chunkTitle
                 }
             });
         }
@@ -190,15 +262,19 @@ export class AstCodeSplitter implements Splitter {
 
             if (currentChunk.length + lineWithNewline.length > this.chunkSize && currentChunk.length > 0) {
                 // Create a sub-chunk
-                subChunks.push({
-                    content: currentChunk.trim(),
-                    metadata: {
-                        startLine: currentStartLine,
-                        endLine: currentStartLine + currentLineCount - 1,
-                        language: chunk.metadata.language,
-                        filePath: chunk.metadata.filePath,
-                    }
-                });
+                const content = currentChunk.trim();
+                if (content.length > 0) {
+                    subChunks.push({
+                        content,
+                        metadata: {
+                            startLine: currentStartLine,
+                            endLine: currentStartLine + currentLineCount - 1,
+                            language: chunk.metadata.language,
+                            filePath: chunk.metadata.filePath,
+                            chunkTitle: this.getChunkTitle(content, chunk.metadata.filePath)
+                        }
+                    });
+                }
 
                 currentChunk = lineWithNewline;
                 currentStartLine = chunk.metadata.startLine + i;
@@ -211,13 +287,15 @@ export class AstCodeSplitter implements Splitter {
 
         // Add the last sub-chunk
         if (currentChunk.trim().length > 0) {
+            const content = currentChunk.trim();
             subChunks.push({
-                content: currentChunk.trim(),
+                content,
                 metadata: {
                     startLine: currentStartLine,
                     endLine: currentStartLine + currentLineCount - 1,
                     language: chunk.metadata.language,
                     filePath: chunk.metadata.filePath,
+                    chunkTitle: this.getChunkTitle(content, chunk.metadata.filePath)
                 }
             });
         }
@@ -244,6 +322,8 @@ export class AstCodeSplitter implements Splitter {
                 metadata.startLine = Math.max(1, metadata.startLine - this.getLineCount(overlapText));
             }
 
+            metadata.chunkTitle = metadata.chunkTitle || this.getChunkTitle(content, metadata.filePath);
+
             overlappedChunks.push({
                 content,
                 metadata
@@ -266,5 +346,199 @@ export class AstCodeSplitter implements Splitter {
             'java', 'cpp', 'c++', 'c', 'go', 'rust', 'rs', 'cs', 'csharp', 'scala'
         ];
         return supportedLanguages.includes(language.toLowerCase());
+    }
+
+    /**
+     * Extract symbol metadata from AST node
+     */
+    private extractSymbolMetadata(node: Parser.SyntaxNode, language: string, code: string): SymbolMetadata | null {
+        const enableSymbolExtraction = process.env.ENABLE_SYMBOL_EXTRACTION !== 'false';
+        if (!enableSymbolExtraction) {
+            return null;
+        }
+
+        try {
+            const name = this.getSymbolName(node, language);
+            const kind = this.getSymbolKind(node.type);
+            
+            if (!name || !kind) {
+                return null;
+            }
+
+            const signature = this.getSymbolSignature(node, language, code);
+            const parent = this.getParentSymbol(node);
+            const docstring = this.extractDocstring(node, code);
+
+            return {
+                name,
+                kind,
+                signature,
+                parent,
+                docstring
+            };
+        } catch (error) {
+            console.warn(`[ASTSplitter] Failed to extract symbol metadata:`, error);
+            return null;
+        }
+    }
+
+    /**
+     * Get symbol name from node
+     */
+    private getSymbolName(node: Parser.SyntaxNode, language: string): string | null {
+        const extractor = SYMBOL_EXTRACTORS[language.toLowerCase()];
+        if (!extractor) {
+            return null;
+        }
+
+        // Find the identifier child node
+        for (const child of node.children) {
+            if (child.type === extractor.nameNode || child.type === 'identifier') {
+                return child.text;
+            }
+            
+            // For some nodes, the name might be nested
+            for (const grandchild of child.children) {
+                if (grandchild.type === extractor.nameNode || grandchild.type === 'identifier') {
+                    return grandchild.text;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Map node type to semantic symbol kind
+     */
+    private getSymbolKind(nodeType: string): SymbolMetadata['kind'] | null {
+        return NODE_TYPE_TO_KIND[nodeType] || null;
+    }
+
+    /**
+     * Extract function/method signature
+     */
+    private getSymbolSignature(node: Parser.SyntaxNode, language: string, code: string): string | undefined {
+        const extractor = SYMBOL_EXTRACTORS[language.toLowerCase()];
+        if (!extractor) {
+            return undefined;
+        }
+
+        // Find parameter node
+        for (const child of node.children) {
+            if (child.type === extractor.paramNode || 
+                child.type === 'parameters' || 
+                child.type === 'formal_parameters' ||
+                child.type === 'parameter_list') {
+                return child.text;
+            }
+        }
+
+        return undefined;
+    }
+
+    /**
+     * Get parent symbol name (class/module containing this symbol)
+     */
+    private getParentSymbol(node: Parser.SyntaxNode): string | undefined {
+        let current = node.parent;
+        
+        while (current) {
+            const parentType = current.type;
+            
+            // Check if parent is a class, interface, module, etc.
+            if (parentType.includes('class') || 
+                parentType.includes('interface') ||
+                parentType.includes('module') ||
+                parentType.includes('namespace') ||
+                parentType === 'impl_item') {
+                
+                // Find the name of the parent
+                for (const child of current.children) {
+                    if (child.type === 'identifier' || child.type === 'type_identifier') {
+                        return child.text;
+                    }
+                }
+            }
+            
+            current = current.parent;
+        }
+        
+        return undefined;
+    }
+
+    /**
+     * Extract docstring or comment preceding the symbol
+     */
+    private extractDocstring(node: Parser.SyntaxNode, code: string): string | undefined {
+        const startLine = node.startPosition.row;
+        const lines = code.split('\n');
+        
+        // Look at lines immediately before the node
+        const lookbackLines = Math.min(5, startLine);
+        const precedingLines: string[] = [];
+        
+        for (let i = startLine - 1; i >= startLine - lookbackLines && i >= 0; i--) {
+            const line = lines[i].trim();
+            
+            // Check for comment patterns
+            if (line.startsWith('//') || 
+                line.startsWith('#') || 
+                line.startsWith('/*') || 
+                line.includes('*/') ||
+                line.startsWith('*') ||
+                line.startsWith('"""') ||
+                line.startsWith("'''")) {
+                precedingLines.unshift(line);
+            } else if (line.length > 0 && precedingLines.length > 0) {
+                // Stop if we hit non-comment content after finding comments
+                break;
+            }
+        }
+        
+        if (precedingLines.length === 0) {
+            return undefined;
+        }
+        
+        // Clean up comment markers and join
+        const docstring = precedingLines
+            .map(line => {
+                return line
+                    .replace(/^\/\/\s?/, '')
+                    .replace(/^#\s?/, '')
+                    .replace(/^\/\*+\s?/, '')
+                    .replace(/\s?\*+\/$/, '')
+                    .replace(/^\*\s?/, '')
+                    .replace(/^"""\s?/, '')
+                    .replace(/^'''\s?/, '')
+                    .trim();
+            })
+            .filter(line => line.length > 0)
+            .join(' ');
+        
+        // Limit docstring length
+        return docstring.length > 200 ? docstring.substring(0, 197) + '...' : docstring;
+    }
+
+    private getChunkTitle(content: string, filePath?: string): string | undefined {
+        const lines = content.split('\n');
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (trimmed.length === 0) continue;
+
+            // Skip import/export lines when possible to surface meaningful symbol lines
+            if (/^(import\s|export\s|#include\s)/i.test(trimmed)) {
+                continue;
+            }
+
+            return trimmed.length > 120 ? `${trimmed.slice(0, 117)}...` : trimmed;
+        }
+
+        if (filePath) {
+            const fileName = filePath.split(/[\\/]/).pop();
+            return fileName ? `Section from ${fileName}` : undefined;
+        }
+
+        return undefined;
     }
 }

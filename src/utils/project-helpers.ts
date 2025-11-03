@@ -1,5 +1,11 @@
 import { Pool, PoolClient } from 'pg';
 
+/**
+ * Sentinel value to represent "all projects" scope
+ * Used internally to bypass project-specific filtering
+ */
+export const ALL_PROJECTS_SENTINEL = '__ALL_PROJECTS__';
+
 export interface Project {
   id: string;
   name: string;
@@ -27,7 +33,7 @@ export async function getOrCreateProject(
   try {
     // Try to get existing project
     const selectResult = await client.query(
-      'SELECT id, name FROM projects WHERE name = $1',
+      'SELECT id, name FROM claude_context.projects WHERE name = $1',
       [name]
     );
 
@@ -40,7 +46,7 @@ export async function getOrCreateProject(
 
     // Create new project
     const insertResult = await client.query(
-      `INSERT INTO projects (name, description, is_active, is_global)
+      `INSERT INTO claude_context.projects (name, description, is_active, is_global)
        VALUES ($1, $2, true, false)
        RETURNING id, name`,
       [name, description || `Project: ${name}`]
@@ -70,7 +76,7 @@ export async function getOrCreateDataset(
   try {
     // Try to get existing dataset
     const selectResult = await client.query(
-      'SELECT id, name FROM datasets WHERE project_id = $1 AND name = $2',
+      'SELECT id, name FROM claude_context.datasets WHERE project_id = $1 AND name = $2',
       [projectId, name]
     );
 
@@ -83,7 +89,7 @@ export async function getOrCreateDataset(
 
     // Create new dataset
     const insertResult = await client.query(
-      `INSERT INTO datasets (project_id, name, description, status, is_global)
+      `INSERT INTO claude_context.datasets (project_id, name, description, status, is_global)
        VALUES ($1, $2, $3, 'active', false)
        RETURNING id, name`,
       [projectId, name, description || `Dataset: ${name}`]
@@ -102,8 +108,30 @@ export async function getOrCreateDataset(
 }
 
 /**
+ * Get all dataset IDs across all projects
+ * @param includeGlobal Whether to include global datasets (default: true)
+ */
+export async function getAllDatasetIds(
+  client: PoolClient | Pool,
+  includeGlobal: boolean = true
+): Promise<string[]> {
+  try {
+    const query = includeGlobal
+      ? `SELECT DISTINCT id FROM claude_context.datasets`
+      : `SELECT DISTINCT id FROM claude_context.datasets WHERE is_global = false`;
+
+    const result = await client.query(query);
+    return result.rows.map(row => row.id);
+  } catch (error) {
+    console.error(`[ProjectHelpers] ❌ Failed to get all dataset IDs:`, error);
+    throw error;
+  }
+}
+
+/**
  * Get all accessible dataset IDs for a project
  * Includes: owned datasets + shared datasets + global datasets
+ * Special case: if projectId is ALL_PROJECTS_SENTINEL, returns all datasets
  */
 export async function getAccessibleDatasets(
   client: PoolClient | Pool,
@@ -111,16 +139,21 @@ export async function getAccessibleDatasets(
   includeGlobal: boolean = true
 ): Promise<string[]> {
   try {
+    // Special case: "all" projects scope
+    if (projectId === ALL_PROJECTS_SENTINEL) {
+      return getAllDatasetIds(client, includeGlobal);
+    }
+
     const query = `
       SELECT DISTINCT d.id
-      FROM datasets d
+      FROM claude_context.datasets d
       WHERE 
         -- Owned datasets
         d.project_id = $1
         -- Shared datasets
         OR EXISTS (
-          SELECT 1 FROM project_shares ps
-          WHERE ps.target_project_id = $1
+          SELECT 1 FROM claude_context.project_shares ps
+          WHERE ps.to_project_id = $1
             AND ps.resource_type = 'dataset'
             AND ps.resource_id = d.id
             AND ps.can_read = true
@@ -152,14 +185,14 @@ export async function isResourceAccessible(
       case 'dataset':
         query = `
           SELECT EXISTS (
-            SELECT 1 FROM datasets d
+            SELECT 1 FROM claude_context.datasets d
             WHERE d.id = $2
               AND (
                 d.project_id = $1
                 OR d.is_global = true
                 OR EXISTS (
-                  SELECT 1 FROM project_shares ps
-                  WHERE ps.target_project_id = $1
+                  SELECT 1 FROM claude_context.project_shares ps
+                  WHERE ps.to_project_id = $1
                     AND ps.resource_type = 'dataset'
                     AND ps.resource_id = $2
                     AND ps.can_read = true
@@ -172,16 +205,16 @@ export async function isResourceAccessible(
       case 'document':
         query = `
           SELECT EXISTS (
-            SELECT 1 FROM documents doc
-            JOIN datasets d ON doc.dataset_id = d.id
+            SELECT 1 FROM claude_context.documents doc
+            JOIN claude_context.datasets d ON doc.dataset_id = d.id
             WHERE doc.id = $2
               AND (
                 d.project_id = $1
                 OR d.is_global = true
                 OR doc.is_global = true
                 OR EXISTS (
-                  SELECT 1 FROM project_shares ps
-                  WHERE ps.target_project_id = $1
+                  SELECT 1 FROM claude_context.project_shares ps
+                  WHERE ps.to_project_id = $1
                     AND ps.resource_type = 'document'
                     AND ps.resource_id = $2
                     AND ps.can_read = true
@@ -194,16 +227,16 @@ export async function isResourceAccessible(
       case 'web_page':
         query = `
           SELECT EXISTS (
-            SELECT 1 FROM web_pages wp
-            JOIN datasets d ON wp.dataset_id = d.id
+            SELECT 1 FROM claude_context.web_pages wp
+            JOIN claude_context.datasets d ON wp.dataset_id = d.id
             WHERE wp.id = $2
               AND (
                 d.project_id = $1
                 OR d.is_global = true
                 OR wp.is_global = true
                 OR EXISTS (
-                  SELECT 1 FROM project_shares ps
-                  WHERE ps.target_project_id = $1
+                  SELECT 1 FROM claude_context.project_shares ps
+                  WHERE ps.to_project_id = $1
                     AND ps.resource_type = 'web_page'
                     AND ps.resource_id = $2
                     AND ps.can_read = true
@@ -235,7 +268,7 @@ export async function getProjectByName(
   try {
     const result = await client.query(
       `SELECT id, name, description, is_active as "isActive", is_global as "isGlobal"
-       FROM projects
+       FROM claude_context.projects
        WHERE name = $1`,
       [name]
     );
@@ -261,7 +294,7 @@ export async function getProjectById(
   try {
     const result = await client.query(
       `SELECT id, name, description, is_active as "isActive", is_global as "isGlobal"
-       FROM projects
+       FROM claude_context.projects
        WHERE id = $1`,
       [id]
     );
@@ -290,10 +323,10 @@ export async function shareResource(
 ): Promise<void> {
   try {
     await client.query(
-      `INSERT INTO project_shares 
-       (source_project_id, target_project_id, resource_type, resource_id, can_read, can_write, can_delete)
+      `INSERT INTO claude_context.project_shares 
+       (from_project_id, to_project_id, resource_type, resource_id, can_read, can_write, can_delete)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (source_project_id, target_project_id, resource_type, resource_id)
+       ON CONFLICT (from_project_id, to_project_id, resource_type, resource_id)
        DO UPDATE SET
          can_read = EXCLUDED.can_read,
          can_write = EXCLUDED.can_write,
@@ -329,9 +362,9 @@ export async function revokeResourceShare(
 ): Promise<void> {
   try {
     await client.query(
-      `DELETE FROM project_shares
-       WHERE source_project_id = $1
-         AND target_project_id = $2
+      `DELETE FROM claude_context.project_shares
+       WHERE from_project_id = $1
+         AND to_project_id = $2
          AND resource_type = $3
          AND resource_id = $4`,
       [sourceProjectId, targetProjectId, resourceType, resourceId]
@@ -354,7 +387,7 @@ export async function listProjectDatasets(
   try {
     const result = await client.query(
       `SELECT id, name, project_id as "projectId", description, is_global as "isGlobal"
-       FROM datasets
+       FROM claude_context.datasets
        WHERE project_id = $1
        ORDER BY created_at DESC`,
       [projectId]

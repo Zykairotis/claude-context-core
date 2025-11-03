@@ -5,3 +5,7 @@ export * from './types';
 export * from './context';
 export * from './sync/synchronizer';
 export * from './utils';
+export * from './api/ingest';
+export * from './api/query';
+export * from './api/smart-query';
+export * from './ui';

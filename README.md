@@ -3,6 +3,18 @@
 
 The core indexing engine for Claude Context - a powerful tool for semantic search and analysis of codebases using vector embeddings and AI.
 
+## Phase A Updates (Project-Aware Storage)
+
+- ✅ **PostgreSQL dual-vector adapter** (`PostgresDualVectorDatabase`) is now the default local backend. The Docker compose file ships with a pgvector service and an optional Qdrant profile for Phase B work.
+- ✅ **Project-aware ingest + query APIs** are available via `ingestGithubRepository`, `ingestCrawlPages`, and `queryProject`. They wire into the existing `Context` and orchestrator schema (projects, datasets, shares).
+- ✅ **MCP server tools** now accept `project`, `dataset`, and provenance metadata. Use `claudeContext.index`/`search` for project-aware runs and `claudeContext.ingestCrawl` for Crawl4AI upserts.
+- ✅ **Persistent defaults**: run `claudeContext.init` once to store a default project/dataset (written to `~/.context/claude-mcp.json`). Subsequent MCP commands automatically fall back to those values when `project`/`dataset` are omitted (`claudeContext.defaults` shows the current settings).
+- ✅ **Dockerized crawler**: launch `docker compose --profile crawl4ai up crawl4ai` to fetch pages via the new REST service (`services/crawl4ai-runner`). Feed the results into `ingestCrawlPages()` + the `Context` chunker to index web content immediately.
+- ✅ **Native Qdrant integration**: set `VECTOR_DATABASE_PROVIDER=qdrant`, point `QDRANT_URL` at your cluster (defaults to `http://localhost:6333`), and keep `POSTGRES_CONNECTION_STRING` configured for metadata. Hybrid retrieval now runs against Qdrant with RRF fusion, while Postgres continues to track projects/datasets.
+- ✅ **Tests** were added under `src/api/__tests__` covering ingest/query flows with mocked Postgres clients. Run them with `npm run test`.
+
+Everything remains usable without project metadata—omit the `project` argument and the legacy single-collection workflow still works.
+
 [![npm version](https://img.shields.io/npm/v/@zilliz/claude-context-core.svg)](https://www.npmjs.com/package/@zilliz/claude-context-core)
 [![npm downloads](https://img.shields.io/npm/dm/@zilliz/claude-context-core.svg)](https://www.npmjs.com/package/@zilliz/claude-context-core)
 
@@ -91,6 +103,29 @@ results.forEach(result => {
   console.log(result.content);
 });
 ```
+
+## Liquid Glass Frontend Console
+
+The repository now ships a shadcn-inspired glassmorphism control plane under `src/ui`. Mount the `App` component inside your preferred React / Vite / Next.js shell to orchestrate ingestion, hybrid retrieval, and scope management visually.
+
+```tsx
+import React from 'react';
+import { createRoot } from 'react-dom/client';
+import { App, MockContextApiClient, ShadcnGlassStyles } from '@zilliz/claude-context-core';
+
+const root = createRoot(document.getElementById('root')!);
+
+root.render(
+  <React.StrictMode>
+    <ShadcnGlassStyles />
+    <App />
+  </React.StrictMode>
+);
+```
+
+- **Mock vs live data:** Switch the mode selector to `Live API` and provide your backend base URL to call the REST endpoints defined in `plan/05-api.md`. Leave it on `Mock data` to explore the full pipeline using the curated sample telemetry.
+- **Focus areas:** GitHub & Crawl4AI ingestion orchestration, hybrid query playground, global/project/local scope explorer, pipeline throughput telemetry, and operations timeline.
+- **Styling:** The UI uses shadcn component patterns (`Button`, `Tabs`, `Card`) paired with glassmorphism CSS injected via `ShadcnGlassStyles`, so no Tailwind build step is required for the showcase.
 
 ## Features
 

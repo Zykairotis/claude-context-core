@@ -9,6 +9,7 @@
 
 const path = require('path');
 const { z } = require('zod');
+const { Pool } = require('pg');
 
 const sdkCjsRoot = path.join(__dirname, 'node_modules', '@modelcontextprotocol', 'sdk', 'dist', 'cjs');
 const { McpServer } = require(path.join(sdkCjsRoot, 'server', 'mcp.js'));
@@ -23,8 +24,17 @@ const {
   GeminiEmbedding,
   OllamaEmbedding,
   VoyageAIEmbedding,
-  PostgresDualVectorDatabase
-} = require('./dist');
+  PostgresDualVectorDatabase,
+  QdrantVectorDatabase,
+  ingestGithubRepository,
+  ingestCrawlPages,
+  queryProject,
+  getOrCreateProject,
+  getOrCreateDataset,
+  loadMcpDefaults,
+  saveMcpDefaults,
+  getMcpConfigPath
+} = require('./dist/core');
 
 function toInt(value, defaultValue) {
   if (value === undefined || value === null || value === '') {
@@ -114,19 +124,38 @@ function createEmbedding() {
 
 function createVectorDatabase() {
   const provider = (process.env.VECTOR_DATABASE_PROVIDER || 'postgres').toLowerCase();
+  const connectionString = process.env.POSTGRES_CONNECTION_STRING;
+  if (!connectionString) {
+    throw new Error('POSTGRES_CONNECTION_STRING is required for metadata storage');
+  }
+
+  const maxConnections = toInt(process.env.POSTGRES_MAX_CONNECTIONS, undefined);
+  const batchSize = toInt(process.env.POSTGRES_BATCH_SIZE, undefined);
+  const pool = new Pool({
+    connectionString,
+    max: maxConnections || 10,
+    idleTimeoutMillis: 30000
+  });
 
   switch (provider) {
     case 'postgres':
     case 'pg': {
-      const connectionString = process.env.POSTGRES_CONNECTION_STRING;
-      if (!connectionString) {
-        throw new Error('POSTGRES_CONNECTION_STRING is required when VECTOR_DATABASE_PROVIDER=postgres');
-      }
-      return new PostgresDualVectorDatabase({
+      const vectorDatabase = new PostgresDualVectorDatabase({
         connectionString,
-        maxConnections: toInt(process.env.POSTGRES_MAX_CONNECTIONS, undefined),
-        batchSize: toInt(process.env.POSTGRES_BATCH_SIZE, undefined)
+        maxConnections,
+        batchSize
       });
+      return { vectorDatabase, pool };
+    }
+
+    case 'qdrant': {
+      const qdrantUrl = process.env.QDRANT_URL || 'http://localhost:6333';
+      const qdrantApiKey = process.env.QDRANT_API_KEY;
+      const vectorDatabase = new QdrantVectorDatabase({
+        url: qdrantUrl,
+        apiKey: qdrantApiKey
+      });
+      return { vectorDatabase, pool };
     }
 
     default:
@@ -157,12 +186,15 @@ function formatSearchResults(results) {
 
 async function main() {
   const embedding = createEmbedding();
-  const vectorDatabase = createVectorDatabase();
-  const context = new Context({ embedding, vectorDatabase });
+  const { vectorDatabase, pool: postgresPool } = createVectorDatabase();
+  const context = new Context({ embedding, vectorDatabase, postgresPool });
+  let mcpDefaults = await loadMcpDefaults();
 
   const instructions = 'Real-time MCP server wrapping the local claude-context-core build.\n' +
-    'Tools: claudeContext.index, claudeContext.reindex, claudeContext.search, claudeContext.clear, claudeContext.status.\n' +
-    'Set environment variables (embedding + database) before launching.';
+    'Codebase Tools: claudeContext.index, claudeContext.reindex, claudeContext.search, claudeContext.ingestCrawl, claudeContext.init, claudeContext.defaults, claudeContext.clear, claudeContext.status.\n' +
+    'Web Crawling Tools: claudeContext.crawl, claudeContext.crawlStatus, claudeContext.cancelCrawl.\n' +
+    'Chunk Retrieval Tools: claudeContext.searchChunks, claudeContext.getChunk, claudeContext.listScopes.\n' +
+    'Set environment variables (embedding + database) before launching. Ensure crawl4ai service is running on port 7070.';
 
   const mcpServer = new McpServer({
     name: 'claude-context-core-dev',
@@ -173,22 +205,220 @@ async function main() {
 
   const toolNamespace = 'claudeContext';
 
+  mcpServer.registerTool(`${toolNamespace}.init`, {
+    title: 'Set Default Project',
+    description: 'Persist a default project (and optional dataset) for subsequent commands',
+    inputSchema: {
+      project: z.string().min(1).describe('Default project to use when none is provided'),
+      dataset: z.string().optional().describe('Optional default dataset for the project')
+    }
+  }, async ({ project, dataset }) => {
+    try {
+      const poolInstance = context.getPostgresPool();
+      if (!poolInstance) {
+        throw new Error('PostgreSQL pool not configured. Cannot verify project.');
+      }
+
+      const client = await poolInstance.connect();
+      try {
+        const projectRecord = await getOrCreateProject(client, project);
+        let finalDataset = dataset?.trim();
+
+        if (finalDataset) {
+          await getOrCreateDataset(client, projectRecord.id, finalDataset);
+        }
+
+        await saveMcpDefaults({ project, dataset: finalDataset });
+        mcpDefaults = { project, dataset: finalDataset };
+
+        return {
+          content: [{
+            type: 'text',
+            text: `Defaults updated.\nProject: ${project}\nDataset: ${finalDataset ?? 'not set'}\nStored at: ${getMcpConfigPath()}`
+          }],
+          structuredContent: {
+            defaults: mcpDefaults,
+            configPath: getMcpConfigPath()
+          }
+        };
+      } finally {
+        client.release();
+      }
+    } catch (error) {
+      return {
+        content: [{
+          type: 'text',
+          text: `Failed to set defaults: ${error instanceof Error ? error.message : String(error)}`
+        }],
+        isError: true
+      };
+    }
+  });
+
+  mcpServer.registerTool(`${toolNamespace}.defaults`, {
+    title: 'Show Default Project',
+    description: 'Display the stored default project/dataset used for commands when omitted',
+    inputSchema: {}
+  }, async () => {
+    const project = mcpDefaults.project ?? null;
+    const dataset = mcpDefaults.dataset ?? null;
+    const summary = [
+      `Project: ${project ?? 'not set'}`,
+      `Dataset: ${dataset ?? 'not set'}`,
+      `Config Path: ${getMcpConfigPath()}`
+    ].join('\n');
+
+    return {
+      content: [{
+        type: 'text',
+        text: summary
+      }],
+      structuredContent: {
+        defaults: mcpDefaults,
+        configPath: getMcpConfigPath()
+      }
+    };
+  });
+
+  mcpServer.registerTool(`${toolNamespace}.ingestCrawl`, {
+    title: 'Ingest Crawl4AI Pages',
+    description: 'Upsert Crawl4AI pages into the orchestrator database for a project/dataset',
+    inputSchema: {
+      project: z.string().min(1).describe('Project name'),
+      dataset: z.string().min(1).describe('Dataset name'),
+      pages: z.array(z.object({
+        url: z.string().url().describe('Page URL'),
+        markdownContent: z.string().describe('Primary markdown or text content'),
+        htmlContent: z.string().optional(),
+        title: z.string().optional(),
+        domain: z.string().optional(),
+        wordCount: z.number().int().optional(),
+        charCount: z.number().int().optional(),
+        contentHash: z.string().optional(),
+        metadata: z.record(z.any()).optional(),
+        isGlobal: z.boolean().optional()
+      })).min(1).max(25).describe('Pages to upsert in this batch')
+    }
+  }, async ({ project, dataset, pages }) => {
+    try {
+      const projectName = project || mcpDefaults.project;
+      const datasetName = dataset || mcpDefaults.dataset;
+
+      if (!projectName) {
+        throw new Error('Project is required (set a default via claudeContext.init or pass project explicitly).');
+      }
+
+      if (!datasetName) {
+        throw new Error('Dataset is required (set a default via claudeContext.init or pass dataset explicitly).');
+      }
+
+      const response = await ingestCrawlPages(context, {
+        project: projectName,
+        dataset: datasetName,
+        pages
+      });
+      if (response.status === 'failed') {
+        throw new Error(response.error || 'Crawl ingest failed');
+      }
+      return {
+        content: [{
+          type: 'text',
+          text: `Ingested ${response.ingestedCount} pages for project "${projectName}" / dataset "${datasetName}".`
+        }],
+        structuredContent: {
+          project: projectName,
+          dataset: datasetName,
+          ingestedCount: response.ingestedCount,
+          pageIds: response.pageIds
+        }
+      };
+    } catch (error) {
+      return {
+        content: [{
+          type: 'text',
+          text: `Crawl ingest failed: ${error instanceof Error ? error.message : String(error)}`
+        }],
+        isError: true
+      };
+    }
+  });
+
   mcpServer.registerTool(`${toolNamespace}.index`, {
     title: 'Index Codebase',
-    description: 'Index a repository or folder using the local claude-context core',
+    description: 'Index a repository or folder (project-aware when project is supplied)',
     inputSchema: {
       path: z.string().describe('Absolute path to the project or repository root'),
+      project: z.string().min(1).optional().describe('Project name for project-aware indexing'),
+      dataset: z.string().min(1).optional().describe('Dataset name (defaults to repo name)'),
+      repo: z.string().optional().describe('Repository name for provenance metadata'),
+      branch: z.string().optional().describe('Branch name for provenance metadata'),
+      sha: z.string().optional().describe('Commit SHA for provenance metadata'),
       force: z.boolean().optional().describe('Re-create the collection even if it already exists')
     }
-  }, async ({ path, force }, extra) => {
+  }, async ({ path: codebasePath, project, dataset, repo, branch, sha, force }, extra) => {
     const start = Date.now();
     try {
-      const stats = await context.indexCodebase(path, progress => {
+      const projectName = project || mcpDefaults.project;
+      const datasetDefault = projectName ? mcpDefaults.dataset : undefined;
+      const datasetName = dataset || datasetDefault;
+
+      if (projectName) {
+        const ingestResult = await ingestGithubRepository(context, {
+          project: projectName,
+          dataset: datasetName,
+          repo: repo || datasetName || path.basename(codebasePath),
+          codebasePath,
+          branch,
+          sha,
+          forceReindex: force === true,
+          onProgress: progress => {
+            mcpServer.sendLoggingMessage({
+              level: 'info',
+              logger: 'claude-context:index',
+              data: {
+                project: projectName,
+                dataset: datasetName || repo || path.basename(codebasePath),
+                path: codebasePath,
+                phase: progress.phase,
+                current: progress.current,
+                total: progress.total,
+                percentage: progress.percentage
+              }
+            }, extra.sessionId);
+          }
+        });
+
+        if (ingestResult.status === 'failed') {
+          throw new Error(ingestResult.error || 'Project ingest failed');
+        }
+
+        const duration = Date.now() - start;
+        const stats = ingestResult.stats;
+        return {
+          content: [{
+            type: 'text',
+            text: `Project ${projectName} indexed in ${(duration / 1000).toFixed(2)}s\n` +
+              `Dataset: ${datasetName || repo || path.basename(codebasePath)}\n` +
+              `Files indexed: ${stats?.indexedFiles ?? 0}\n` +
+              `Chunks: ${stats?.totalChunks ?? 0}\n` +
+              `Status: ${stats?.status ?? 'completed'}`
+          }],
+          structuredContent: {
+            path: codebasePath,
+            project: projectName,
+            dataset: datasetName || repo || path.basename(codebasePath),
+            durationMs: duration,
+            stats
+          }
+        };
+      }
+
+      const stats = await context.indexCodebase(codebasePath, progress => {
         mcpServer.sendLoggingMessage({
           level: 'info',
           logger: 'claude-context:index',
           data: {
-            path,
+            path: codebasePath,
             phase: progress.phase,
             current: progress.current,
             total: progress.total,
@@ -199,26 +429,22 @@ async function main() {
 
       const duration = Date.now() - start;
       return {
-        content: [
-          {
-            type: 'text',
-            text: formatIndexStats(path, stats, duration)
-          }
-        ],
+        content: [{
+          type: 'text',
+          text: formatIndexStats(codebasePath, stats, duration)
+        }],
         structuredContent: {
-          path,
+          path: codebasePath,
           durationMs: duration,
           ...stats
         }
       };
     } catch (error) {
       return {
-        content: [
-          {
-            type: 'text',
-            text: `Indexing failed: ${error instanceof Error ? error.message : String(error)}`
-          }
-        ],
+        content: [{
+          type: 'text',
+          text: `Indexing failed: ${error instanceof Error ? error.message : String(error)}`
+        }],
         isError: true
       };
     }
@@ -260,37 +486,98 @@ async function main() {
 
   mcpServer.registerTool(`${toolNamespace}.search`, {
     title: 'Semantic Search',
-    description: 'Query indexed code semantically',
+    description: 'Query indexed code semantically (project-aware when project supplied)',
     inputSchema: {
       path: z.string().describe('Absolute path to the indexed project'),
       query: z.string().describe('Natural language search query'),
+      project: z.string().min(1).optional().describe('Project name for project-aware retrieval'),
+      dataset: z.string().optional().describe('Limit search to a specific dataset'),
+      includeGlobal: z.boolean().optional().describe('Include global datasets (default true)'),
       topK: z.number().int().min(1).max(50).optional().describe('Maximum number of matches to return'),
-      threshold: z.number().min(0).max(1).optional().describe('Similarity threshold (0-1)')
+      threshold: z.number().min(0).max(1).optional().describe('Similarity threshold (0-1)'),
+      repo: z.string().optional().describe('Filter by repository'),
+      lang: z.string().optional().describe('Filter by language'),
+      pathPrefix: z.string().optional().describe('Filter by relative path prefix'),
+      filter: z.string().optional().describe('Legacy vector-database filter expression (non-project searches)')
     }
-  }, async ({ path, query, topK, threshold }) => {
+  }, async ({ path: codebasePath, query, project, dataset, includeGlobal, topK, threshold, repo, lang, pathPrefix, filter }) => {
     try {
-      const results = await context.semanticSearch(path, query, topK, threshold);
-      return {
-        content: [
-          {
+      const projectName = project || mcpDefaults.project;
+      const datasetDefault = projectName ? mcpDefaults.dataset : undefined;
+      const datasetName = dataset || datasetDefault;
+
+      if (projectName) {
+        const progressUpdates = [];
+        const results = await queryProject(context, {
+          project: projectName,
+          dataset: datasetName,
+          includeGlobal,
+          query,
+          codebasePath,
+          repo,
+          lang,
+          pathPrefix,
+          topK,
+          threshold
+        }, (phase, percentage, detail) => {
+          progressUpdates.push({ phase, percentage, detail, timestamp: new Date().toISOString() });
+          console.log(`[Query Progress] ${phase}: ${percentage}% - ${detail}`);
+        });
+
+        if (!results.results.length) {
+          return {
+            content: [{
+              type: 'text',
+              text: `No matches found for project "${projectName}".`
+            }],
+            structuredContent: {
+              path: codebasePath,
+              project: projectName,
+              query,
+              results: []
+            }
+          };
+        }
+
+        const formatted = results.results.map((result, idx) => {
+          const span = `${result.lineSpan.start}-${result.lineSpan.end}`;
+          const score = (result.scores.final ?? result.scores.vector).toFixed(4);
+          return `#${idx + 1} ${result.file}:${span}\nScore: ${score}\nRepo: ${result.repo ?? 'n/a'}\n${result.chunk.trim()}`;
+        }).join('\n\n');
+
+        return {
+          content: [{
             type: 'text',
-            text: formatSearchResults(results)
+            text: formatted
+          }],
+          structuredContent: {
+            path: codebasePath,
+            project: projectName,
+            dataset: datasetName ?? null,
+            query,
+            results: results.results
           }
-        ],
+        };
+      }
+
+      const results = await context.semanticSearch(codebasePath, query, topK, threshold, filter);
+      return {
+        content: [{
+          type: 'text',
+          text: formatSearchResults(results)
+        }],
         structuredContent: {
-          path,
+          path: codebasePath,
           query,
           results
         }
       };
     } catch (error) {
       return {
-        content: [
-          {
-            type: 'text',
-            text: `Search failed: ${error instanceof Error ? error.message : String(error)}`
-          }
-        ],
+        content: [{
+          type: 'text',
+          text: `Search failed: ${error instanceof Error ? error.message : String(error)}`
+        }],
         isError: true
       };
     }
@@ -310,59 +597,19 @@ async function main() {
       let totalChunks = 0;
       let hasIndex = false;
 
-      const isDual = typeof context.isAutoEmbeddingMonster === 'function'
-        ? context.isAutoEmbeddingMonster()
-        : false;
-
-      if (isDual) {
-        const { text, code, textModel, codeModel } = context.getCollectionNames(path);
-        const textExists = await vectorDatabase.hasCollection(text);
-        const codeExists = await vectorDatabase.hasCollection(code);
-        hasIndex = textExists || codeExists;
-
-        if (textExists) {
-          let entityCount = null;
-          if (supportsStats) {
-            const stats = await vectorDatabase.getCollectionStats(text);
-            entityCount = stats?.entityCount ?? null;
-            if (entityCount !== null) totalChunks += entityCount;
-          }
-          collections.push({
-            name: text,
-            model: textModel,
-            entityCount
-          });
+      const collectionName = context.getCollectionName(path);
+      hasIndex = await vectorDatabase.hasCollection(collectionName);
+      if (hasIndex) {
+        let entityCount = null;
+        if (supportsStats) {
+          const stats = await vectorDatabase.getCollectionStats(collectionName);
+          entityCount = stats?.entityCount ?? null;
+          if (entityCount !== null) totalChunks += entityCount;
         }
-
-        if (codeExists) {
-          let entityCount = null;
-          if (supportsStats) {
-            const stats = await vectorDatabase.getCollectionStats(code);
-            entityCount = stats?.entityCount ?? null;
-            if (entityCount !== null) totalChunks += entityCount;
-          }
-          collections.push({
-            name: code,
-            model: codeModel,
-            entityCount
-          });
-        }
-      }
-      else {
-        const collectionName = context.getCollectionName(path);
-        hasIndex = await vectorDatabase.hasCollection(collectionName);
-        if (hasIndex) {
-          let entityCount = null;
-          if (supportsStats) {
-            const stats = await vectorDatabase.getCollectionStats(collectionName);
-            entityCount = stats?.entityCount ?? null;
-            if (entityCount !== null) totalChunks += entityCount;
-          }
-          collections.push({
-            name: collectionName,
-            entityCount
-          });
-        }
+        collections.push({
+          name: collectionName,
+          entityCount
+        });
       }
 
       let summary;
@@ -460,6 +707,378 @@ async function main() {
     }
   });
 
+  // Crawl4AI Service Tools
+  mcpServer.registerTool(`${toolNamespace}.crawl`, {
+    title: 'Crawl Web Pages',
+    description: 'Trigger crawl4ai service to crawl and index web pages with chunking, code detection, and AI summaries',
+    inputSchema: {
+      url: z.string().url().describe('URL to crawl'),
+      project: z.string().optional().describe('Project name for storage isolation'),
+      dataset: z.string().optional().describe('Dataset name for storage isolation'),
+      scope: z.enum(['global', 'local', 'project']).optional().describe('Knowledge scope (default: local)'),
+      mode: z.enum(['single', 'batch', 'recursive', 'sitemap']).optional().describe('Crawling mode (default: single)'),
+      maxDepth: z.number().optional().describe('Maximum depth for recursive crawling (default: 1)'),
+      autoDiscovery: z.boolean().optional().describe('Auto-discover llms.txt and sitemaps (default: true)'),
+      extractCode: z.boolean().optional().describe('Extract code examples (default: true)')
+    }
+  }, async ({ url, project, dataset, scope, mode, maxDepth, autoDiscovery, extractCode }) => {
+    try {
+      const fetch = (await import('node-fetch')).default;
+      
+      // Start crawl
+      const crawlRequest = {
+        urls: [url],
+        project: project || mcpDefaults.project,
+        dataset: dataset || mcpDefaults.dataset,
+        scope,
+        mode: mode || 'single',
+        max_depth: maxDepth || 1,
+        auto_discovery: autoDiscovery !== false,
+        extract_code_examples: extractCode !== false
+      };
+
+      const startResponse = await fetch('http://localhost:7070/crawl', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(crawlRequest)
+      });
+
+      if (!startResponse.ok) {
+        throw new Error(`Crawl start failed: ${startResponse.statusText}`);
+      }
+
+      const { progress_id, status } = await startResponse.json();
+
+      // Poll progress until complete
+      let attempts = 0;
+      const maxAttempts = 120; // 2 minutes max
+      
+      while (attempts < maxAttempts) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        const progressResponse = await fetch(`http://localhost:7070/progress/${progress_id}`);
+        if (!progressResponse.ok) {
+          throw new Error(`Progress check failed: ${progressResponse.statusText}`);
+        }
+
+        const progress = await progressResponse.json();
+        
+        if (progress.status === 'completed') {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Crawl completed successfully!\n\nProject: ${project || 'default'}\nDataset: ${dataset || 'default'}\nScope: ${scope || 'local'}\n\nProcessed: ${progress.processed_pages || 0} pages\nChunks stored: ${progress.chunks_stored || 0}\nProgress: ${progress.progress}%`
+              }
+            ],
+            structuredContent: {
+              progress_id,
+              status: progress.status,
+              chunks_stored: progress.chunks_stored,
+              processed_pages: progress.processed_pages
+            }
+          };
+        }
+        
+        if (progress.status === 'failed' || progress.status === 'cancelled') {
+          throw new Error(`Crawl ${progress.status}: ${progress.log}`);
+        }
+        
+        attempts++;
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Crawl still running after 2 minutes. Progress ID: ${progress_id}. Use crawlStatus to check progress.`
+          }
+        ],
+        structuredContent: {
+          progress_id,
+          status: 'running',
+          timeout: true
+        }
+      };
+
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Crawl failed: ${error instanceof Error ? error.message : String(error)}`
+          }
+        ],
+        isError: true
+      };
+    }
+  });
+
+  mcpServer.registerTool(`${toolNamespace}.crawlStatus`, {
+    title: 'Check Crawl Status',
+    description: 'Check the status of a running crawl operation',
+    inputSchema: {
+      progressId: z.string().describe('Progress ID from crawl start')
+    }
+  }, async ({ progressId }) => {
+    try {
+      const fetch = (await import('node-fetch')).default;
+      
+      const response = await fetch(`http://localhost:7070/progress/${progressId}`);
+      if (!response.ok) {
+        throw new Error(`Progress check failed: ${response.statusText}`);
+      }
+
+      const progress = await response.json();
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Crawl Status: ${progress.status}\nProgress: ${progress.progress}%\nLog: ${progress.log}\nCurrent URL: ${progress.current_url || 'N/A'}\nProcessed: ${progress.processed_pages || 0}/${progress.total_pages || 0}\nChunks stored: ${progress.chunks_stored || 0}`
+          }
+        ],
+        structuredContent: progress
+      };
+
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Status check failed: ${error instanceof Error ? error.message : String(error)}`
+          }
+        ],
+        isError: true
+      };
+    }
+  });
+
+  mcpServer.registerTool(`${toolNamespace}.cancelCrawl`, {
+    title: 'Cancel Crawl',
+    description: 'Cancel a running crawl operation',
+    inputSchema: {
+      progressId: z.string().describe('Progress ID from crawl start')
+    }
+  }, async ({ progressId }) => {
+    try {
+      const fetch = (await import('node-fetch')).default;
+      
+      const response = await fetch(`http://localhost:7070/cancel/${progressId}`, {
+        method: 'POST'
+      });
+      
+      if (!response.ok) {
+        throw new Error(`Cancel failed: ${response.statusText}`);
+      }
+
+      const result = await response.json();
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Crawl cancelled successfully. Progress ID: ${progressId}`
+          }
+        ],
+        structuredContent: result
+      };
+
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Cancel failed: ${error instanceof Error ? error.message : String(error)}`
+          }
+        ],
+        isError: true
+      };
+    }
+  });
+
+  // Retrieval Tools
+  mcpServer.registerTool(`${toolNamespace}.searchChunks`, {
+    title: 'Search Chunks',
+    description: 'Search for chunks with scope filtering, code/text filtering, and similarity ranking',
+    inputSchema: {
+      query: z.string().describe('Search query'),
+      project: z.string().optional().describe('Project name for filtering'),
+      dataset: z.string().optional().describe('Dataset name for filtering'),
+      scope: z.enum(['global', 'local', 'project', 'all']).optional().describe('Scope level for filtering'),
+      filterCode: z.boolean().optional().describe('Only return code chunks'),
+      filterText: z.boolean().optional().describe('Only return text chunks'),
+      limit: z.number().optional().describe('Maximum results (default: 10)')
+    }
+  }, async ({ query, project, dataset, scope, filterCode, filterText, limit }) => {
+    try {
+      const fetch = (await import('node-fetch')).default;
+      
+      const searchRequest = {
+        query,
+        project: project || mcpDefaults.project,
+        dataset: dataset || mcpDefaults.dataset,
+        scope,
+        filter_code: filterCode,
+        filter_text: filterText,
+        limit: limit || 10
+      };
+
+      const response = await fetch('http://localhost:7070/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(searchRequest)
+      });
+
+      if (!response.ok) {
+        throw new Error(`Search failed: ${response.statusText}`);
+      }
+
+      const data = await response.json();
+      
+      // Format results
+      let resultText = `Found ${data.total} chunks for query: "${data.query}"\n\n`;
+      
+      data.results.forEach((chunk, idx) => {
+        resultText += `[${idx + 1}] ${chunk.is_code ? 'CODE' : 'TEXT'} (${chunk.language}) - Score: ${chunk.similarity_score.toFixed(3)}\n`;
+        resultText += `Source: ${chunk.relative_path}\n`;
+        resultText += `Summary: ${chunk.summary}\n`;
+        resultText += `Content (first 200 chars): ${chunk.chunk_text.substring(0, 200)}...\n`;
+        resultText += `Scope: ${chunk.scope} | Model: ${chunk.model_used}\n\n`;
+      });
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: resultText
+          }
+        ],
+        structuredContent: data
+      };
+
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Search failed: ${error instanceof Error ? error.message : String(error)}`
+          }
+        ],
+        isError: true
+      };
+    }
+  });
+
+  mcpServer.registerTool(`${toolNamespace}.getChunk`, {
+    title: 'Get Chunk',
+    description: 'Retrieve a specific chunk by ID',
+    inputSchema: {
+      chunkId: z.string().describe('Chunk ID'),
+      includeContext: z.boolean().optional().describe('Include surrounding chunks (not yet implemented)')
+    }
+  }, async ({ chunkId, includeContext }) => {
+    try {
+      const fetch = (await import('node-fetch')).default;
+      
+      const response = await fetch(`http://localhost:7070/chunk/${chunkId}`);
+
+      if (!response.ok) {
+        throw new Error(`Get chunk failed: ${response.statusText}`);
+      }
+
+      const chunk = await response.json();
+      
+      const resultText = `Chunk ID: ${chunk.id}\n` +
+        `Type: ${chunk.is_code ? 'CODE' : 'TEXT'} (${chunk.language})\n` +
+        `Source: ${chunk.relative_path} (chunk ${chunk.chunk_index})\n` +
+        `Scope: ${chunk.scope} | Model: ${chunk.model_used}\n\n` +
+        `Summary:\n${chunk.summary}\n\n` +
+        `Full Content:\n${chunk.chunk_text}`;
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: resultText
+          }
+        ],
+        structuredContent: chunk
+      };
+
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Get chunk failed: ${error instanceof Error ? error.message : String(error)}`
+          }
+        ],
+        isError: true
+      };
+    }
+  });
+
+  mcpServer.registerTool(`${toolNamespace}.listScopes`, {
+    title: 'List Scopes',
+    description: 'List available scopes with chunk statistics',
+    inputSchema: {
+      project: z.string().optional().describe('Filter by project name')
+    }
+  }, async ({ project }) => {
+    try {
+      const fetch = (await import('node-fetch')).default;
+      
+      let url = 'http://localhost:7070/scopes';
+      if (project) {
+        url += `?project=${encodeURIComponent(project)}`;
+      }
+
+      const response = await fetch(url);
+
+      if (!response.ok) {
+        throw new Error(`List scopes failed: ${response.statusText}`);
+      }
+
+      const scopes = await response.json();
+      
+      let resultText = `Available Scopes (${scopes.length}):\n\n`;
+      
+      scopes.forEach((scope) => {
+        const codeRatio = scope.chunk_count > 0 
+          ? (scope.code_chunks / scope.chunk_count * 100).toFixed(1) 
+          : 0;
+        
+        resultText += `Collection: ${scope.collection_name}\n`;
+        resultText += `Scope: ${scope.scope}\n`;
+        resultText += `Total Chunks: ${scope.chunk_count}\n`;
+        resultText += `  - Code: ${scope.code_chunks} (${codeRatio}%)\n`;
+        resultText += `  - Text: ${scope.text_chunks} (${(100 - parseFloat(codeRatio)).toFixed(1)}%)\n\n`;
+      });
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: resultText
+          }
+        ],
+        structuredContent: scopes
+      };
+
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `List scopes failed: ${error instanceof Error ? error.message : String(error)}`
+          }
+        ],
+        isError: true
+      };
+    }
+  });
+
   const transport = new StdioServerTransport();
 
   async function shutdown(signal) {
@@ -471,6 +1090,9 @@ async function main() {
       });
       if (vectorDatabase && typeof vectorDatabase.close === 'function') {
         await vectorDatabase.close();
+      }
+      if (postgresPool) {
+        await postgresPool.end();
       }
     } catch (error) {
       console.error('Shutdown error:', error);
@@ -490,4 +1112,3 @@ main().catch(error => {
   console.error('Failed to start claude-context MCP server:', error);
   process.exit(1);
 });
-

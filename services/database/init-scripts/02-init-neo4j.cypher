@@ -1,4 +1,4 @@
-// Cognee Neo4j Knowledge Graph Initialization Script
+// Context Core Neo4j Knowledge Graph Initialization Script
 // This script sets up constraints, indexes, and the initial graph schema
 
 // ============================================
@@ -86,11 +86,11 @@ FOR (d:Document) ON EACH [d.source_path, d.content_type];
 // ============================================
 
 // Create a system metadata node to track graph schema version
-MERGE (sys:SystemMetadata {id: 'cognee_graph_schema'})
+MERGE (sys:SystemMetadata {id: 'context_graph_schema'})
 ON CREATE SET 
     sys.version = '1.0.0',
     sys.initialized_at = datetime(),
-    sys.description = 'Cognee Knowledge Graph Schema'
+    sys.description = 'Context Core Knowledge Graph Schema'
 ON MATCH SET
     sys.last_checked = datetime();
 
@@ -149,6 +149,6 @@ RETURN count(name) as apoc_procedures_available;
 // ============================================
 
 // Return confirmation
-RETURN 'Cognee Neo4j graph schema initialized successfully' AS status,
+RETURN 'Context Core Neo4j graph schema initialized successfully' AS status,
        'Version 1.0.0' AS schema_version,
        datetime() AS initialized_at;

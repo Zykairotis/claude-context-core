@@ -11,14 +11,13 @@ import {
 import {
     VectorDatabase,
     VectorDocument,
-    VectorSearchResult,
-    HybridSearchRequest,
-    HybridSearchOptions,
-    HybridSearchResult
+    VectorSearchResult
 } from './vectordb';
 import { SemanticSearchResult } from './types';
 import { envManager } from './utils/env-manager';
 import { getOrCreateProject, getOrCreateDataset } from './utils/project-helpers';
+import { RerankerClient } from './utils/reranker-client';
+import { SpladeClient } from './utils/splade-client';
 import { Pool } from 'pg';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -120,6 +119,9 @@ export class Context {
     private ignorePatterns: string[];
     private synchronizers = new Map<string, FileSynchronizer>();
     private postgresPool?: Pool;
+    private readonly chunkStatsEnabled: boolean;
+    private rerankerClient?: RerankerClient;
+    private spladeClient?: SpladeClient;
 
     constructor(config: ContextConfig = {}) {
         this.postgresPool = config.postgresPool;
@@ -135,7 +137,18 @@ export class Context {
         }
         this.vectorDatabase = config.vectorDatabase;
 
-        this.codeSplitter = config.codeSplitter || new AstCodeSplitter(2500, 300);
+        const chunkStatsFlag = envManager.get('CHUNK_STATS_VERBOSE');
+        this.chunkStatsEnabled = typeof chunkStatsFlag === 'string' && chunkStatsFlag.toLowerCase() === 'true';
+
+        if (config.codeSplitter) {
+            this.codeSplitter = config.codeSplitter;
+        } else {
+            const defaultChunkSize = this.getNumericEnv('CHUNK_CHAR_TARGET', 1000);
+            const defaultChunkOverlap = this.getNumericEnv('CHUNK_CHAR_OVERLAP', 100, { allowZero: true });
+            this.codeSplitter = new AstCodeSplitter(defaultChunkSize, defaultChunkOverlap);
+            const approxTokens = Math.round(defaultChunkSize / 4);
+            console.log(`[Context] ✂️  Code splitter configured for ~${defaultChunkSize} characters (~${approxTokens} tokens) with ${defaultChunkOverlap} character overlap`);
+        }
 
         // Load custom extensions from environment variables
         const envCustomExtensions = this.getCustomExtensionsFromEnv();
@@ -163,6 +176,14 @@ export class Context {
         // Remove duplicates
         this.ignorePatterns = [...new Set(allIgnorePatterns)];
 
+        // Initialize reranker and SPLADE clients if enabled
+        if (process.env.ENABLE_RERANKING === 'true') {
+            this.rerankerClient = new RerankerClient();
+        }
+        if (process.env.ENABLE_HYBRID_SEARCH === 'true') {
+            this.spladeClient = new SpladeClient();
+        }
+
         console.log(`[Context] 🔧 Initialized with ${this.supportedExtensions.length} supported extensions and ${this.ignorePatterns.length} ignore patterns`);
         if (envCustomExtensions.length > 0) {
             console.log(`[Context] 📎 Loaded ${envCustomExtensions.length} custom extensions from environment: ${envCustomExtensions.join(', ')}`);
@@ -184,6 +205,27 @@ export class Context {
      */
     getVectorDatabase(): VectorDatabase {
         return this.vectorDatabase;
+    }
+
+    /**
+     * Get configured PostgreSQL pool if available
+     */
+    getPostgresPool(): Pool | undefined {
+        return this.postgresPool;
+    }
+
+    /**
+     * Get configured reranker client when enabled
+     */
+    getRerankerClient(): RerankerClient | undefined {
+        return this.rerankerClient;
+    }
+
+    /**
+     * Get configured SPLADE client when enabled
+     */
+    getSpladeClient(): SpladeClient | undefined {
+        return this.spladeClient;
     }
 
     /**
@@ -425,112 +467,112 @@ export class Context {
      * @param threshold Similarity threshold
      */
     async semanticSearch(codebasePath: string, query: string, topK: number = 5, threshold: number = 0.5, filterExpr?: string): Promise<SemanticSearchResult[]> {
-        const isHybrid = this.getIsHybrid();
-        const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
-        console.log(`[Context] 🔍 Executing ${searchType}: "${query}" in ${codebasePath}`);
+        const isHybridMode = this.getIsHybrid();
+        const hybridEnabled = isHybridMode === true && this.spladeClient?.isEnabled();
+        const rerankEnabled = process.env.ENABLE_RERANKING === 'true' && this.rerankerClient;
+
+        const searchLabel = hybridEnabled ? 'hybrid search' : 'semantic search';
+        console.log(`[Context] 🔍 Executing ${searchLabel}: "${query}" in ${codebasePath}`);
 
         const collectionName = this.getCollectionName(codebasePath);
         console.log(`[Context] 🔍 Using collection: ${collectionName}`);
 
-        // Check if collection exists and has data
         const hasCollection = await this.vectorDatabase.hasCollection(collectionName);
         if (!hasCollection) {
             console.log(`[Context] ⚠️  Collection '${collectionName}' does not exist. Please index the codebase first.`);
             return [];
         }
 
-        if (isHybrid === true) {
-            try {
-                // Check collection stats to see if it has data
-                const stats = await this.vectorDatabase.query(collectionName, '', ['id'], 1);
-                console.log(`[Context] 🔍 Collection '${collectionName}' exists and appears to have data`);
-            } catch (error) {
-                console.log(`[Context] ⚠️  Collection '${collectionName}' exists but may be empty or not properly indexed:`, error);
-            }
+        const initialK = rerankEnabled
+            ? parseInt(process.env.RERANK_INITIAL_K || '150', 10)
+            : topK;
+        const finalK = rerankEnabled
+            ? parseInt(process.env.RERANK_FINAL_K || `${topK}`, 10)
+            : topK;
 
-            // 1. Generate query vector
             console.log(`[Context] 🔍 Generating embeddings for query: "${query}"`);
             const queryEmbedding: EmbeddingVector = await this.embedding.embed(query);
             console.log(`[Context] ✅ Generated embedding vector with dimension: ${queryEmbedding.vector.length}`);
-            console.log(`[Context] 🔍 First 5 embedding values: [${queryEmbedding.vector.slice(0, 5).join(', ')}]`);
 
-            // 2. Prepare hybrid search requests
-            const searchRequests: HybridSearchRequest[] = [
-                {
-                    data: queryEmbedding.vector,
-                    anns_field: "vector",
-                    param: { "nprobe": 10 },
-                    limit: topK
-                },
-                {
-                    data: query,
-                    anns_field: "sparse_vector",
-                    param: { "drop_ratio_search": 0.2 },
-                    limit: topK
-                }
-            ];
+        let querySparse: { indices: number[]; values: number[] } | undefined;
+        if (hybridEnabled && this.spladeClient) {
+            try {
+                querySparse = await this.spladeClient.computeSparse(query);
+                console.log('[Context] 🔍 Generated sparse query representation');
+            } catch (error) {
+                console.warn('[Context] ⚠️  Failed to compute sparse query vector, continuing with dense search:', error);
+            }
+        }
 
-            console.log(`[Context] 🔍 Search request 1 (dense): anns_field="${searchRequests[0].anns_field}", vector_dim=${queryEmbedding.vector.length}, limit=${searchRequests[0].limit}`);
-            console.log(`[Context] 🔍 Search request 2 (sparse): anns_field="${searchRequests[1].anns_field}", query_text="${query}", limit=${searchRequests[1].limit}`);
-
-            // 3. Execute hybrid search
-            console.log(`[Context] 🔍 Executing hybrid search with RRF reranking...`);
-            const searchResults: HybridSearchResult[] = await this.vectorDatabase.hybridSearch(
+        let baseResults: VectorSearchResult[] = [];
+        try {
+            if (hybridEnabled && querySparse && typeof (this.vectorDatabase as any).hybridQuery === 'function') {
+                baseResults = await (this.vectorDatabase as any).hybridQuery(
                 collectionName,
-                searchRequests,
-                {
-                    rerank: {
-                        strategy: 'rrf',
-                        params: { k: 100 }
-                    },
-                    limit: topK,
-                    filterExpr
-                }
+                    queryEmbedding.vector,
+                    querySparse,
+                    { topK: initialK, threshold }
+                );
+            } else {
+                baseResults = await this.vectorDatabase.search(
+                    collectionName,
+                    queryEmbedding.vector,
+                    { topK: initialK, threshold, filterExpr }
             );
+            }
+        } catch (error) {
+            console.error('[Context] ❌ Vector search failed:', error);
+            return [];
+        }
 
-            console.log(`[Context] 🔍 Raw search results count: ${searchResults.length}`);
+        type EnrichedResult = {
+            document: VectorDocument;
+            vectorScore: number;
+            rerankScore?: number;
+            finalScore: number;
+        };
 
-            // 4. Convert to semantic search result format
-            const results: SemanticSearchResult[] = searchResults.map(result => ({
-                content: result.document.content,
-                relativePath: result.document.relativePath,
-                startLine: result.document.startLine,
-                endLine: result.document.endLine,
-                language: result.document.metadata.language || 'unknown',
-                score: result.score
+        let enrichedResults: EnrichedResult[] = baseResults.map(result => ({
+            document: result.document,
+            vectorScore: result.score,
+            finalScore: result.score
             }));
 
-            console.log(`[Context] ✅ Found ${results.length} relevant hybrid results`);
-            if (results.length > 0) {
-                console.log(`[Context] 🔍 Top result score: ${results[0].score}, path: ${results[0].relativePath}`);
+        if (rerankEnabled && this.rerankerClient && enrichedResults.length > 0) {
+            try {
+                const candidateTexts = enrichedResults.map(result => `${result.document.relativePath}\n${result.document.content}`);
+                const rerankScores = await this.rerankerClient.rerank(query, candidateTexts);
+
+                enrichedResults = enrichedResults.map((result, index) => ({
+                    ...result,
+                    rerankScore: rerankScores[index] ?? result.finalScore,
+                    finalScore: rerankScores[index] ?? result.finalScore
+                }));
+
+                enrichedResults.sort((a, b) => b.finalScore - a.finalScore);
+            } catch (error) {
+                console.warn('[Context] ⚠️  Reranking failed, returning vector scores:', error);
             }
+        }
 
-            return results;
-        } else {
-            // Regular semantic search
-            // 1. Generate query vector
-            const queryEmbedding: EmbeddingVector = await this.embedding.embed(query);
+        const limit = Math.max(1, finalK);
+        const trimmedResults = enrichedResults.slice(0, limit);
 
-            // 2. Search in vector database
-            const searchResults: VectorSearchResult[] = await this.vectorDatabase.search(
-                collectionName,
-                queryEmbedding.vector,
-                { topK, threshold, filterExpr }
-            );
-
-            // 3. Convert to semantic search result format
-            const results: SemanticSearchResult[] = searchResults.map(result => ({
+        const results: SemanticSearchResult[] = trimmedResults.map(result => ({
                 content: result.document.content,
                 relativePath: result.document.relativePath,
                 startLine: result.document.startLine,
                 endLine: result.document.endLine,
                 language: result.document.metadata.language || 'unknown',
-                score: result.score
+            score: result.finalScore
             }));
 
             console.log(`[Context] ✅ Found ${results.length} relevant results`);
-            return results;
+        if (results.length > 0) {
+            console.log(`[Context] 🔍 Top result score: ${results[0].score}, path: ${results[0].relativePath}`);
         }
+
+            return results;
     }
 
     /**
@@ -834,9 +876,27 @@ export class Context {
     ): Promise<void> {
         const isHybrid = this.getIsHybrid();
 
-        // Generate embedding vectors
+        if (this.chunkStatsEnabled) {
+            this.logChunkStats(chunks);
+        }
+
+        // Generate embedding vectors - run dense and sparse in parallel for speed
         const chunkContents = chunks.map(chunk => chunk.content);
-        const embeddings = await this.embedding.embedBatch(chunkContents);
+        const batchStart = performance.now();
+        
+        const [embeddings, sparseVectors] = await Promise.all([
+            this.embedding.embedBatch(chunkContents),
+            (isHybrid === true && this.spladeClient?.isEnabled())
+                ? this.spladeClient.computeSparseBatch(chunkContents).catch(error => {
+                    console.warn('[Context] ⚠️  Failed to compute SPLADE sparse vectors, continuing with dense-only indexing:', error);
+                    return undefined;
+                })
+                : Promise.resolve(undefined)
+        ]);
+
+        const batchDuration = performance.now() - batchStart;
+        const throughput = (chunks.length / (batchDuration / 1000)).toFixed(1);
+        console.log(`[Context] ⚡ Batch processed ${chunks.length} chunks in ${(batchDuration / 1000).toFixed(2)}s (${throughput} chunks/sec, hybrid=${isHybrid})`);
 
         if (isHybrid === true) {
             // Create hybrid vector documents
@@ -849,9 +909,10 @@ export class Context {
                 const fileExtension = path.extname(chunk.metadata.filePath);
                 const { filePath, startLine, endLine, ...restMetadata } = chunk.metadata;
                 const lang = this.getLanguageFromExtension(fileExtension);
+                const chunkIndex = chunk.metadata.chunkIndex ?? index;
 
                 return {
-                    id: this.generateId(relativePath, chunk.metadata.startLine || 0, chunk.metadata.endLine || 0, chunk.content),
+                    id: this.generateId(relativePath, chunk.metadata.startLine || 0, chunk.metadata.endLine || 0, chunk.content, chunkIndex),
                     content: chunk.content, // Full text content for BM25 and storage
                     vector: embeddings[index].vector, // Dense vector
                     relativePath,
@@ -867,11 +928,12 @@ export class Context {
                     branch: provenance?.branch,
                     sha: provenance?.sha,
                     lang,
+                    sparse: sparseVectors?.[index],
                     metadata: {
                         ...restMetadata,
                         codebasePath,
                         language: chunk.metadata.language || 'unknown',
-                        chunkIndex: index
+                        chunkIndex
                     }
                 };
             });
@@ -889,9 +951,10 @@ export class Context {
                 const fileExtension = path.extname(chunk.metadata.filePath);
                 const { filePath, startLine, endLine, ...restMetadata } = chunk.metadata;
                 const lang = this.getLanguageFromExtension(fileExtension);
+                const chunkIndex = chunk.metadata.chunkIndex ?? index;
 
                 return {
-                    id: this.generateId(relativePath, chunk.metadata.startLine || 0, chunk.metadata.endLine || 0, chunk.content),
+                    id: this.generateId(relativePath, chunk.metadata.startLine || 0, chunk.metadata.endLine || 0, chunk.content, chunkIndex),
                     vector: embeddings[index].vector,
                     content: chunk.content,
                     relativePath,
@@ -911,7 +974,7 @@ export class Context {
                         ...restMetadata,
                         codebasePath,
                         language: chunk.metadata.language || 'unknown',
-                        chunkIndex: index
+                        chunkIndex
                     }
                 };
             });
@@ -959,10 +1022,37 @@ export class Context {
      * @param content Chunk content
      * @returns Hash-based unique ID
      */
-    private generateId(relativePath: string, startLine: number, endLine: number, content: string): string {
-        const combinedString = `${relativePath}:${startLine}:${endLine}:${content}`;
+    private generateId(relativePath: string, startLine: number, endLine: number, content: string, chunkIndex?: number): string {
+        const combinedString = `${relativePath}:${startLine}:${endLine}:${chunkIndex ?? -1}:${content}`;
         const hash = crypto.createHash('sha256').update(combinedString, 'utf-8').digest('hex');
         return `chunk_${hash.substring(0, 16)}`;
+    }
+
+    private logChunkStats(chunks: CodeChunk[]): void {
+        if (!chunks.length) {
+            return;
+        }
+
+        const tokenEstimates = chunks.map(chunk => Math.max(1, Math.ceil(chunk.content.length / 4)));
+        const totalTokens = tokenEstimates.reduce((sum, value) => sum + value, 0);
+        const avgTokens = Math.round(totalTokens / tokenEstimates.length);
+        const minTokens = Math.min(...tokenEstimates);
+        const maxTokens = Math.max(...tokenEstimates);
+
+        const lineCounts = chunks.map(chunk => {
+            const start = typeof chunk.metadata.startLine === 'number' ? chunk.metadata.startLine : 0;
+            const end = typeof chunk.metadata.endLine === 'number' ? chunk.metadata.endLine : 0;
+            if (start > 0 && end >= start) {
+                return Math.max(1, end - start + 1);
+            }
+            return Math.max(1, chunk.content.split('\n').length);
+        });
+
+        const avgLines = Math.round(lineCounts.reduce((sum, value) => sum + value, 0) / lineCounts.length);
+        const minLines = Math.min(...lineCounts);
+        const maxLines = Math.max(...lineCounts);
+
+        console.log(`[Context] 📏 Chunk batch stats -> count=${chunks.length}, tokens(avg≈${avgTokens}, range ${minTokens}-${maxTokens}), lines(avg≈${avgLines}, range ${minLines}-${maxLines})`);
     }
 
     /**
@@ -1201,6 +1291,27 @@ export class Context {
         }
     }
 
+    private getNumericEnv(varName: string, fallback: number, options?: { allowZero?: boolean; min?: number }): number {
+        const rawValue = envManager.get(varName);
+        if (!rawValue || rawValue.trim().length === 0) {
+            return fallback;
+        }
+
+        const parsed = Number(rawValue);
+        if (!Number.isFinite(parsed)) {
+            console.warn(`[Context] ⚠️  Invalid numeric value for ${varName} (${rawValue}), using fallback ${fallback}`);
+            return fallback;
+        }
+
+        const minimum = options?.min ?? (options?.allowZero ? 0 : 1);
+        if (parsed < minimum) {
+            console.warn(`[Context] ⚠️  ${varName} below minimum (${minimum}), using fallback ${fallback}`);
+            return fallback;
+        }
+
+        return Math.floor(parsed);
+    }
+
     /**
      * Add custom extensions (from MCP or other sources) without replacing existing ones
      * @param customExtensions Array of custom extensions to add
@@ -1381,7 +1492,16 @@ export class Context {
         let processedFiles = 0;
         let totalChunks = 0;
         const chunkBatch: CodeChunk[] = [];
-        const BATCH_SIZE = 50;
+        // Reduced batch size to prevent SPLADE OOM - configurable via env
+        const BATCH_SIZE = parseInt(process.env.CHUNK_BATCH_SIZE || '16', 10);
+        // Reduced concurrent batches to prevent GPU memory overload
+        const MAX_CONCURRENT_BATCHES = parseInt(process.env.MAX_CONCURRENT_BATCHES || '1', 10);
+        const batchQueue: Promise<void>[] = [];
+
+        const processBatchAsync = async (chunks: CodeChunk[]) => {
+            await this.processChunkBatch(chunks, codebasePath, projectContext, provenance);
+            totalChunks += chunks.length;
+        };
 
         for (const filePath of codeFiles) {
             try {
@@ -1389,13 +1509,43 @@ export class Context {
                 const language = this.getLanguageFromExtension(path.extname(filePath));
                 const chunks = await this.codeSplitter.split(fileContent, language, filePath);
 
+                chunks.forEach((chunk, chunkIdx) => {
+                    const originalMetadata = chunk.metadata ?? {};
+                    chunk.metadata = {
+                        ...originalMetadata,
+                        filePath: originalMetadata.filePath || filePath,
+                        chunkIndex: chunkIdx
+                    };
+                });
+
                 for (const chunk of chunks) {
                     chunkBatch.push(chunk);
                     
                     if (chunkBatch.length >= BATCH_SIZE) {
-                        await this.processChunkBatch(chunkBatch, codebasePath, projectContext, provenance);
-                        totalChunks += chunkBatch.length;
+                        // Clone the batch to avoid mutation issues
+                        const batchToProcess = [...chunkBatch];
                         chunkBatch.length = 0;
+                        
+                        // Start processing this batch concurrently
+                        const batchPromise = processBatchAsync(batchToProcess);
+                        batchQueue.push(batchPromise);
+                        
+                        // If we hit max concurrent batches, wait for one to complete
+                        if (batchQueue.length >= MAX_CONCURRENT_BATCHES) {
+                            await Promise.race(batchQueue);
+                            // Remove completed promises
+                            for (let i = batchQueue.length - 1; i >= 0; i--) {
+                                const promise = batchQueue[i];
+                                // Check if promise is settled by racing with immediate resolution
+                                const settled = await Promise.race([
+                                    promise.then(() => true),
+                                    Promise.resolve(false)
+                                ]);
+                                if (settled) {
+                                    batchQueue.splice(i, 1);
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -1414,9 +1564,11 @@ export class Context {
 
         // Process remaining chunks
         if (chunkBatch.length > 0) {
-            await this.processChunkBatch(chunkBatch, codebasePath, projectContext, provenance);
-            totalChunks += chunkBatch.length;
+            batchQueue.push(processBatchAsync([...chunkBatch]));
         }
+
+        // Wait for all remaining batches to complete
+        await Promise.all(batchQueue);
 
         console.log(`[Context] ✅ Project-aware indexing completed! Processed ${processedFiles} files, generated ${totalChunks} chunks`);
         options?.progressCallback?.({ phase: 'Completed', current: 100, total: 100, percentage: 100 });

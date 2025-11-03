@@ -1,0 +1,19 @@
+[project]
+name = "splade-runner"
+version = "0.1.0"
+description = "SPLADE embedding service for Claude Context"
+dependencies = [
+    "torch==2.1.0",
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "pydantic>=2.5.0",
+    "transformers>=4.35.0",
+    "numpy>=1.24.0",
+]
+
+[tool.uv]
+index-url = "https://download.pytorch.org/whl/cu121"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

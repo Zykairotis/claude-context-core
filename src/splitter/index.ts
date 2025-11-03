@@ -1,4 +1,12 @@
 // Interface definitions
+export interface SymbolMetadata {
+    name: string;
+    kind: 'function' | 'class' | 'method' | 'interface' | 'type' | 'module' | 'variable' | 'enum' | 'const' | 'struct' | 'trait';
+    signature?: string;
+    parent?: string;
+    docstring?: string;
+}
+
 export interface CodeChunk {
     content: string;
     metadata: {
@@ -6,6 +14,9 @@ export interface CodeChunk {
         endLine: number;
         language?: string;
         filePath?: string;
+        chunkIndex?: number;
+        chunkTitle?: string;
+        symbol?: SymbolMetadata;
     };
 }
 

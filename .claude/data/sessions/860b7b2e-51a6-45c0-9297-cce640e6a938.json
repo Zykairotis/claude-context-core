@@ -1,0 +1,14 @@
+{
+  "session_id": "860b7b2e-51a6-45c0-9297-cce640e6a938",
+  "prompts": [
+    "/prime ",
+    "actually i was working on the ui have a look at that please have a look at @ui/ and @src/ui/  and i just did this @docs/ui/liquid-glass-refresh.md gather info on this then i will tell u what to do next ",
+    "/agents:agent-spawning make the ui better add glow, neon shadow lite not too much glass effect theme should be redish black oled so that then the glass effects should be better the doc on the left has a problem text are cutting off so just keep icon no name(text) there ",
+    "its too redish very low hint of redness please ",
+    "did u fuck up the padding cause the lower area is usless [Image #1] it shows nothing ",
+    "now i want u to remove labes from class dock-item ie dock-label i dont want that",
+    "can u now remove the mock data from the front end now gracefully do not do anything that can fuck up something ",
+    "the dock is glitching which we have on left make it better and can u make up or suggest a better theming ",
+    "keep it glass effect like and redish and bluish glow "
+  ]
+}

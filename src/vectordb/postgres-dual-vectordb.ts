@@ -488,6 +488,11 @@ export class PostgresDualVectorDatabase implements VectorDatabase {
           params.push(options.filter.repo);
         }
         
+        if (options.filter.pathPrefix) {
+          filterClauses.push(`relative_path LIKE $${paramIndex++}`);
+          params.push(`${options.filter.pathPrefix}%`);
+        }
+        
         if (options.filter.lang) {
           filterClauses.push(`lang = $${paramIndex++}`);
           params.push(options.filter.lang);
@@ -576,6 +581,56 @@ export class PostgresDualVectorDatabase implements VectorDatabase {
       `, [collectionName]);
 
       console.log(`[PostgresDualVectorDB] 🗑️  Deleted ${ids.length} documents from ${collectionName}`);
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Delete documents for a given dataset identifier across a collection
+   */
+  async deleteByDataset(collectionName: string, datasetId: string): Promise<number> {
+    const client = await this.pool.connect();
+    const tableName = this.getTableName(collectionName);
+
+    try {
+      await client.query('BEGIN');
+
+      const result = await client.query(
+        `DELETE FROM ${tableName}
+         WHERE dataset_id = $1
+         RETURNING id`,
+        [datasetId]
+      );
+      const deletedCount = result.rowCount ?? 0;
+
+      if (deletedCount > 0) {
+        await client.query(
+          `UPDATE ${this.schema}.collections_metadata 
+           SET entity_count = (SELECT COUNT(*) FROM ${tableName}),
+               updated_at = CURRENT_TIMESTAMP
+           WHERE collection_name = $1`,
+          [collectionName]
+        );
+      }
+
+      await client.query('COMMIT');
+
+      if (deletedCount > 0) {
+        console.log(`[PostgresDualVectorDB] 🗑️  Deleted ${deletedCount} documents for dataset ${datasetId} from ${collectionName}`);
+      }
+
+      return deletedCount;
+    } catch (error: any) {
+      await client.query('ROLLBACK');
+
+      // Ignore missing relation errors (collection not materialized yet)
+      if (error?.code === '42P01') {
+        console.warn(`[PostgresDualVectorDB] ⚠️  Collection ${collectionName} missing while deleting dataset ${datasetId}`);
+        return 0;
+      }
+
+      throw error;
     } finally {
       client.release();
     }
@@ -701,4 +756,3 @@ export class PostgresDualVectorDatabase implements VectorDatabase {
     return cleaned.split(',').map(v => parseFloat(v.trim()));
   }
 }
-

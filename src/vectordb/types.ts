@@ -22,7 +22,12 @@ export interface VectorDocument {
     
     // Dual vector support
     summaryVector?: number[];
-    sparseVector?: Record<string, number>;
+    
+    // Sparse vector for hybrid search (SPLADE format)
+    sparse?: {
+        indices: number[];
+        values: number[];
+    };
     
     metadata: Record<string, any>;
 }
@@ -46,6 +51,7 @@ export interface HybridSearchOptions {
     rerank?: RerankStrategy;
     limit?: number;
     filterExpr?: string;
+    filter?: Record<string, any>;
 }
 
 export interface RerankStrategy {
@@ -138,6 +144,14 @@ export interface VectorDatabase {
      * @param ids Document ID array
      */
     delete(collectionName: string, ids: string[]): Promise<void>;
+
+    /**
+     * Delete all documents associated with a dataset identifier
+     * @param collectionName Collection name
+     * @param datasetId Dataset UUID
+     * @returns Number of deleted documents when available
+     */
+    deleteByDataset(collectionName: string, datasetId: string): Promise<number | undefined>;
 
     /**
      * Query documents with filter conditions

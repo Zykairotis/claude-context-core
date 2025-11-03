@@ -6,11 +6,11 @@ type SupportedLanguage = "cpp" | "go" | "java" | "js" | "php" | "proto" | "pytho
 
 export class LangChainCodeSplitter implements Splitter {
     private chunkSize: number = 1000;
-    private chunkOverlap: number = 200;
+    private chunkOverlap: number = 100;
 
     constructor(chunkSize?: number, chunkOverlap?: number) {
         if (chunkSize) this.chunkSize = chunkSize;
-        if (chunkOverlap) this.chunkOverlap = chunkOverlap;
+        if (chunkOverlap || chunkOverlap === 0) this.chunkOverlap = chunkOverlap;
     }
 
     async split(code: string, language: string, filePath?: string): Promise<CodeChunk[]> {
@@ -30,7 +30,7 @@ export class LangChainCodeSplitter implements Splitter {
                 const documents = await splitter.createDocuments([code]);
 
                 // Convert to CodeChunk format
-                return documents.map((doc, index) => {
+                return documents.map((doc) => {
                     const lines = doc.metadata?.loc?.lines || { from: 1, to: 1 };
                     return {
                         content: doc.pageContent,
@@ -39,6 +39,7 @@ export class LangChainCodeSplitter implements Splitter {
                             endLine: lines.to,
                             language,
                             filePath,
+                            chunkTitle: this.getChunkTitle(doc.pageContent, filePath)
                         },
                     };
                 });
@@ -98,7 +99,7 @@ export class LangChainCodeSplitter implements Splitter {
 
         const documents = await splitter.createDocuments([code]);
 
-        return documents.map((doc, index) => {
+        return documents.map((doc) => {
             const lines = this.estimateLines(doc.pageContent, code);
             return {
                 content: doc.pageContent,
@@ -107,6 +108,7 @@ export class LangChainCodeSplitter implements Splitter {
                     endLine: lines.end,
                     language,
                     filePath,
+                    chunkTitle: this.getChunkTitle(doc.pageContent, filePath)
                 },
             };
         });
@@ -129,4 +131,27 @@ export class LangChainCodeSplitter implements Splitter {
 
         return { start: startLine, end: endLine };
     }
-} 
+
+    private getChunkTitle(content: string, filePath?: string): string | undefined {
+        const lines = content.split('\n');
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) {
+                continue;
+            }
+
+            if (/^(import\s|export\s|#include\s)/i.test(trimmed)) {
+                continue;
+            }
+
+            return trimmed.length > 120 ? `${trimmed.slice(0, 117)}...` : trimmed;
+        }
+
+        if (filePath) {
+            const fileName = filePath.split(/[\\/]/).pop();
+            return fileName ? `Section from ${fileName}` : undefined;
+        }
+
+        return undefined;
+    }
+}

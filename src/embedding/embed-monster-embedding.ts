@@ -6,6 +6,8 @@ export interface EmbeddingMonsterConfig {
   model: 'gte' | 'coderank';
   gtePort?: number;
   coderankPort?: number;
+  gteHost?: string;
+  coderankHost?: string;
   maxTokens?: number;
   timeout?: number;
   retries?: number;
@@ -45,6 +47,8 @@ export class EmbeddingMonster extends Embedding {
     this.config = {
       gtePort: 30001,
       coderankPort: 30002,
+      gteHost: 'localhost',
+      coderankHost: 'localhost',
       maxTokens: 8192,
       timeout: 30000,
       retries: 3,
@@ -60,8 +64,9 @@ export class EmbeddingMonster extends Embedding {
     this.retries = this.config.retries || 3;
 
     // Set base URL based on model
+    const host = this.config.model === 'gte' ? this.config.gteHost : this.config.coderankHost;
     const port = this.config.model === 'gte' ? this.config.gtePort : this.config.coderankPort;
-    this.baseUrl = `http://localhost:${port}`;
+    this.baseUrl = `http://${host}:${port}`;
   }
 
   private getModelName(): string {

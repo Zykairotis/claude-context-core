@@ -12,5 +12,11 @@ export {
 } from './types';
 
 // Re-export implementations
-export { PostgresDualVectorDatabase } from './postgres-dual-vectordb';
-export { QdrantVectorDatabase } from './qdrant-vectordb';
+export {
+    PostgresDualVectorDatabase,
+    PostgresDualVectorDatabaseConfig
+} from './postgres-dual-vectordb';
+export {
+    QdrantVectorDatabase,
+    QdrantVectorDatabaseConfig
+} from './qdrant-vectordb';

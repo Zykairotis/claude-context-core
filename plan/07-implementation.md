@@ -157,3 +157,11 @@ def pack_context(chunks):
 
     return result
 ```
+
+## Liquid Glass Frontend Console
+
+- **Location:** `src/ui` exposes a shadcn-inspired React console (`App`) with glassmorphism styling injected via `ShadcnGlassStyles`.
+- **Data Contracts:** `src/ui/api/client.ts` mirrors the ingestion/query/share endpoints (`/projects/{name}/ingest/github|crawl`, `/projects/{name}/query`, `/projects/{name}/share`, `/projects/{name}/stats`) and falls back to rich mocks for local demos.
+- **Scope Coordination:** `Tabs` components render global/project/local islands with badge chips for `is_global`, MiniMax macros, and Crawl4AI deltas to match the project isolation model.
+- **Pipeline Telemetry:** `mockPipelinePhases` encodes chunking → summarizer → embeddings → storage sync metrics, aligning throughputs with tree-sitter (~100 chunks/sec), MiniMax (~10 chunks/sec), and embedding rates (~40 chunks/sec).
+- **Operations View:** Timeline overlays hybrid search SLOs, storage pressure, crawl incidents, and dataset shares so ops/SRE can confirm the workflows defined in `plan/04-retrieval.md` and `plan/03-pipelines.md`.
