@@ -1586,4 +1586,104 @@ export class Context {
     isAutoEmbeddingMonster(): boolean {
         return this.embedding.constructor.name === 'AutoEmbeddingMonster';
     }
+
+    /**
+     * Dual-model search: Generate both GTE and CodeRank query embeddings
+     * and search their respective chunks for comprehensive retrieval
+     */
+    async dualModelSearch(
+        collectionName: string,
+        query: string,
+        topK: number,
+        threshold: number,
+        filterExpr?: string,
+        hybridEnabled: boolean = false,
+        querySparse?: { indices: number[]; values: number[] }
+    ): Promise<VectorSearchResult[]> {
+        console.log('[Context] 🎯 Using dual-model retrieval (GTE + CodeRank)');
+
+        // Get both embedding models
+        const autoEmbedding = this.embedding as any;
+        if (!autoEmbedding.getModels) {
+            throw new Error('Dual-model search requires AutoEmbeddingMonster');
+        }
+
+        const { gte, coderank } = autoEmbedding.getModels();
+
+        // Generate query embeddings from both models in parallel
+        const [gteQueryVector, coderankQueryVector] = await Promise.all([
+            gte.embed(query),
+            coderank.embed(query)
+        ]);
+
+        console.log('[Context] ✅ Generated dual query embeddings');
+        console.log(`[Context]   GTE dimension: ${gteQueryVector.dimension}`);
+        console.log(`[Context]   CodeRank dimension: ${coderankQueryVector.dimension}`);
+
+        // Search GTE chunks with GTE query
+        const gteFilter = filterExpr 
+            ? `${filterExpr} AND metadata.model_used == "gte"`
+            : `metadata.model_used == "gte"`;
+
+        // Search CodeRank chunks with CodeRank query  
+        const coderankFilter = filterExpr
+            ? `${filterExpr} AND metadata.model_used == "coderank"`
+            : `metadata.model_used == "coderank"`;
+
+        const searchPromises: Promise<VectorSearchResult[]>[] = [];
+
+        // GTE search
+        if (hybridEnabled && querySparse && typeof (this.vectorDatabase as any).hybridQuery === 'function') {
+            searchPromises.push(
+                (this.vectorDatabase as any).hybridQuery(
+                    collectionName,
+                    gteQueryVector.vector,
+                    querySparse,
+                    { topK: Math.ceil(topK / 2), threshold, filterExpr: gteFilter }
+                ).catch((error: Error) => {
+                    console.warn('[Context] GTE hybrid search failed:', error);
+                    return [];
+                })
+            );
+        } else {
+            searchPromises.push(
+                this.vectorDatabase.search(
+                    collectionName,
+                    gteQueryVector.vector,
+                    { topK: Math.ceil(topK / 2), threshold, filterExpr: gteFilter }
+                ).catch((error: Error) => {
+                    console.warn('[Context] GTE search failed:', error);
+                    return [];
+                })
+            );
+        }
+
+        // CodeRank search
+        searchPromises.push(
+            this.vectorDatabase.search(
+                collectionName,
+                coderankQueryVector.vector,
+                { topK: Math.ceil(topK / 2), threshold, filterExpr: coderankFilter }
+            ).catch((error: Error) => {
+                console.warn('[Context] CodeRank search failed:', error);
+                return [];
+            })
+        );
+
+        // Execute searches in parallel
+        const [gteResults, coderankResults] = await Promise.all(searchPromises);
+
+        console.log(`[Context] 📊 Dual-model results:`);
+        console.log(`[Context]   GTE: ${gteResults.length} chunks`);
+        console.log(`[Context]   CodeRank: ${coderankResults.length} chunks`);
+
+        // Merge and sort by score
+        const mergedResults = [...gteResults, ...coderankResults]
+            .sort((a, b) => b.score - a.score)
+            .slice(0, topK);
+
+        console.log(`[Context] ✅ Merged top ${mergedResults.length} results from both models`);
+
+        return mergedResults;
+    }
 }

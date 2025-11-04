@@ -177,9 +177,9 @@ services:
       # Enhanced AST symbol extraction
       ENABLE_SYMBOL_EXTRACTION: ${ENABLE_SYMBOL_EXTRACTION:-true}
       # Large language model configuration for smart retrieval
-      LLM_API_KEY: ${LLM_API_KEY:-}
-      LLM_API_BASE: ${LLM_API_BASE:-https://api.minimax.io/v1}
-      MODEL_NAME: ${MODEL_NAME:-MiniMax-M2}
+      # LLM_API_KEY loaded from env_file (../.env)
+      # LLM_API_BASE loaded from env_file (../.env)
+      # MODEL_NAME loaded from env_file (../.env)
     extra_hosts:
       - "host.docker.internal:host-gateway"  # Map host.docker.internal to host machine (Linux)
     healthcheck:

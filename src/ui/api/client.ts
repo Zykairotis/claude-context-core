@@ -35,7 +35,7 @@ export interface CrawlIngestForm {
   project: string;
   dataset: string;
   startUrl: string;
-  crawlType: 'breadth-first' | 'depth-first' | 'priority';
+  crawlType: 'single' | 'batch' | 'recursive' | 'sitemap';
   maxPages: number;
   depth: number;
   scope: ScopeLevel;
@@ -58,6 +58,7 @@ export interface QueryRequest {
 export interface SmartQueryRequest extends QueryRequest {
   strategies: SmartStrategy[];
   answerType: 'conversational' | 'structured';
+  dataset?: string;
 }
 
 export interface ProjectSnapshot {
@@ -74,14 +75,24 @@ export interface ShareResourceRequest {
   expiresAt?: string;
 }
 
+export interface WebIngestForm {
+  project: string;
+  pages: Array<{ url: string; content: string; title?: string; domain?: string }>;
+  dataset?: string;
+  forceReindex?: boolean;
+}
+
 export interface ContextClient {
   fetchSnapshot(project: string): Promise<ProjectSnapshot>;
   listScopeResources(project: string): Promise<Record<ScopeLevel, ScopeResource[]>>;
   fetchIngestionJobs(project: string): Promise<IngestionJob[]>;
   triggerGithubIngest(form: GithubIngestForm): Promise<IngestionJob>;
   triggerCrawlIngest(form: CrawlIngestForm): Promise<IngestionJob>;
+  triggerWebIngest(form: WebIngestForm): Promise<IngestionJob>;
+  deleteWebDataset(project: string, dataset: string): Promise<any>;
   runQuery(request: QueryRequest): Promise<RetrievalSession>;
   runSmartQuery(request: SmartQueryRequest): Promise<RetrievalSession>;
+  runWebQuery(request: SmartQueryRequest): Promise<RetrievalSession>;
   listOperations(project: string): Promise<OperationsEvent[]>;
   shareResource(request: ShareResourceRequest): Promise<void>;
   listTools(): Promise<string[]>;
@@ -257,6 +268,84 @@ export class ContextApiClient implements ContextClient {
       startedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       duration: '⏳ live',
       summary
+    };
+  }
+
+  async triggerWebIngest(form: WebIngestForm): Promise<IngestionJob> {
+    const payload = {
+      pages: form.pages,
+      dataset: form.dataset || 'web-content',
+      forceReindex: form.forceReindex === true
+    };
+
+    const response = await this.request<any>(`/projects/${form.project}/ingest/web`, {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+
+    return {
+      id: response.jobId || `job_${Math.random().toString(36).slice(2, 8)}`,
+      source: 'crawl',
+      project: form.project,
+      dataset: form.dataset || 'web-content',
+      scope: 'project',
+      status: response.status || 'completed',
+      startedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      duration: 'Done',
+      summary: `${response.processedPages || form.pages.length} pages ingested, ${response.totalChunks || 0} chunks created`
+    };
+  }
+
+  async deleteWebDataset(project: string, dataset: string): Promise<any> {
+    return this.request<any>(`/projects/${project}/ingest/web?dataset=${encodeURIComponent(dataset)}`, {
+      method: 'DELETE'
+    });
+  }
+
+  async runWebQuery(request: SmartQueryRequest): Promise<RetrievalSession> {
+    const payload = {
+      query: request.query,
+      dataset: request.dataset,
+      strategies: request.strategies,
+      answerType: request.answerType,
+      topK: request.k
+    };
+
+    const response = await this.request<{
+      request_id?: string;
+      answer?: any;
+      results?: any[];
+      metadata?: any;
+      latency_ms?: number;
+    }>(`/projects/${request.project}/query/web`, {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+
+    const results: QueryResult[] = response.results?.map((item) => ({
+      chunk: item.chunk,
+      file: item.url || item.file,
+      lineStart: item.lineSpan?.start || 0,
+      lineEnd: item.lineSpan?.end || 0,
+      vectorScore: item.scores?.vector || 0,
+      sparseScore: item.scores?.sparse || 0,
+      rerankScore: item.scores?.rerank || item.scores?.final || 0,
+      dataset: item.datasetId || '',
+      scope: 'project',
+      why: 'Smart web query result',
+      chunkTitle: item.title,
+    })) || [];
+
+    return {
+      id: response.request_id || `session_${Math.random().toString(36).slice(2, 8)}`,
+      query: request.query,
+      scope: request.scope,
+      results,
+      startedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      latencyMs: response.latency_ms || 0,
+      toolsUsed: ['smartWebQuery'],
+      metadata: response.metadata,
+      smartAnswer: response.answer
     };
   }
 
@@ -620,6 +709,38 @@ export class MockContextApiClient implements ContextClient {
     };
 
     this.retrievalSessions = [session, ...this.retrievalSessions].slice(0, 5);
+    return session;
+  }
+
+  async triggerWebIngest(form: WebIngestForm): Promise<IngestionJob> {
+    const job: IngestionJob = {
+      id: `job_${Math.random().toString(36).slice(2, 8)}`,
+      source: 'crawl',
+      project: form.project,
+      dataset: form.dataset || 'web-content',
+      scope: 'project',
+      status: 'completed',
+      startedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      duration: 'Done',
+      summary: `${form.pages.length} pages ingested to ${form.dataset || 'web-content'}`
+    };
+
+    this.ingestionJobs = [job, ...this.ingestionJobs].slice(0, 6);
+    return job;
+  }
+
+  async deleteWebDataset(project: string, dataset: string): Promise<any> {
+    // Mock implementation - filter out the dataset from ingestion jobs
+    this.ingestionJobs = this.ingestionJobs.filter(
+      job => !(job.project === project && job.dataset === dataset)
+    );
+    return { project, dataset, status: 'deleted' };
+  }
+
+  async runWebQuery(request: SmartQueryRequest): Promise<RetrievalSession> {
+    // Reuse smart query logic with web-specific modifications
+    const session = await this.runSmartQuery(request);
+    session.toolsUsed = ['webQuery', 'smartWebQuery'];
     return session;
   }
 

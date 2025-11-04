@@ -8,4 +8,5 @@ export * from './utils';
 export * from './api/ingest';
 export * from './api/query';
 export * from './api/smart-query';
+export * from './api/smart-web-query';
 export * from './ui';

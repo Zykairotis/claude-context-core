@@ -70,7 +70,7 @@ export interface OperationsEvent {
 }
 
 export interface WebSocketMessage {
-  type: 'postgres:stats' | 'crawl:progress' | 'qdrant:stats' | 'query:progress' | 'github:progress' | 'error' | 'connected';
+  type: 'postgres:stats' | 'crawl:progress' | 'qdrant:stats' | 'query:progress' | 'github:progress' | 'web:ingest:progress' | 'error' | 'connected';
   project?: string;
   sessionId?: string;      // For crawl session isolation
   progressId?: string;     // Alias for sessionId (backward compat)

@@ -93,7 +93,7 @@ export class LLMClient {
       options.maxTokens
         || process.env.LLM_MAX_TOKENS
         || process.env.MINIMAX_MAX_TOKENS // Legacy support
-        || 16384 // 16k tokens by default for longer, more detailed answers
+        || 32768 // 32k tokens for extremely detailed, comprehensive answers (500-600 lines)
     );
 
     this.temperature = Number(
@@ -255,18 +255,70 @@ export class LLMClient {
     const instructions =
       type === 'structured'
         ? [
-            'Produce a comprehensive structured markdown summary with sections: Summary, Key Points, Code Snippets, Recommendations.',
-            'Each code reference should cite the chunk id using the format [chunk:ID].',
-            'Highlight repository paths or symbols when relevant.',
-            'Provide detailed explanations with examples where appropriate.',
-            'Be thorough and comprehensive in your analysis.',
+            'Produce an EXTREMELY COMPREHENSIVE, in-depth structured markdown analysis with these sections:',
+            '  1. **Executive Summary**: Detailed high-level overview (4-6 paragraphs, not just sentences)',
+            '  2. **Detailed Analysis**: EXTENSIVE deep dive into the main topic with exhaustive technical details',
+            '  3. **Key Findings**: Comprehensive bullet points with detailed explanations for each finding',
+            '  4. **Code Examples**: Multiple actual code snippets with thorough line-by-line explanations (cite using [chunk:ID])',
+            '  5. **Technical Details**: Complete architecture breakdown, all design patterns, full dependency analysis, and implementation specifics',
+            '  6. **Implementation Walkthrough**: Step-by-step explanation of how the code works in practice',
+            '  7. **Best Practices & Recommendations**: Extensive recommendations based on ALL code and documentation found',
+            '  8. **Related Concepts**: All connected topics, files, and cross-references mentioned in the context',
+            '  9. **Edge Cases & Error Handling**: How the system handles failures, edge cases, and unusual inputs',
+            '  10. **Performance & Optimization**: Any performance considerations, bottlenecks, or optimization opportunities',
+            '',
+            'CRITICAL LENGTH REQUIREMENTS:',
+            '- Your response MUST be 500-600 LINES of markdown (approximately 3000-4000 words)',
+            '- This is NOT optional - produce exhaustive, detailed content',
+            '- Each section should be 50-100 lines minimum',
+            '- Do NOT summarize or condense - EXPAND and elaborate on EVERY point',
+            '',
+            'Requirements:',
+            '- Cite EVERY code reference, file path, function, class, and variable using [chunk:ID]',
+            '- Include MULTIPLE actual code snippets from different chunks',
+            '- Explain WHY things work the way they do, not just WHAT they are',
+            '- Provide EXTENSIVE background and context for every concept',
+            '- Reference specific line numbers, file paths, and symbols from ALL relevant chunks',
+            '- If the context includes multiple perspectives (text docs + code), synthesize ALL of them',
+            '- Use technical terminology appropriately WITH explanations',
+            '- Include real-world usage examples and scenarios',
+            '- Discuss alternatives, trade-offs, and design decisions',
+            '- Quote relevant sections from the chunks directly',
+            '- Explain HOW the user can apply this information',
           ]
         : [
-            'Produce a detailed conversational markdown response that directly answers the query.',
-            'Cite supporting chunks using the format [chunk:ID] inline with the text.',
-            'Provide thorough explanations, examples, and highlight any assumptions.',
-            'Be comprehensive and include relevant details from the context.',
-            'If there are multiple aspects to the question, address them all.',
+            'Produce an EXTREMELY DETAILED, COMPREHENSIVE conversational markdown response that:',
+            '',
+            '1. **Directly answers the user\'s query** with EXHAUSTIVE information from ALL retrieved context',
+            '2. **Provides in-depth explanations** - explain not just how and why, but also the background, history, and rationale',
+            '3. **Includes MULTIPLE concrete examples** - actual code snippets, file paths, function signatures, and technical details from EVERY relevant chunk',
+            '4. **Synthesizes ALL information** - combine insights from ALL documentation AND code chunks provided',
+            '5. **Cites sources extensively** - use [chunk:ID] for EVERY claim, code snippet, concept, or technical detail',
+            '',
+            'CRITICAL LENGTH REQUIREMENTS:',
+            '- Your response MUST be 500-600 LINES of detailed markdown (approximately 3000-4000 words)',
+            '- This is NOT optional - you must produce exhaustive, detailed content',
+            '- Do NOT summarize or be concise - EXPAND and elaborate on every single point',
+            '- Each major topic should be explained in 50-100 lines minimum',
+            '- If you have 5 code examples, show ALL 5 with full explanations',
+            '',
+            'Detailed Guidelines:',
+            '- Start with a comprehensive introduction (5-10 lines) that sets context',
+            '- For EVERY code reference: show the actual code snippet, explain line-by-line what it does, WHY it\'s designed that way, and how it fits into the larger system',
+            '- Address all aspects of multi-part questions with separate detailed sections for each',
+            '- Explain context thoroughly: "This code in [chunk:123] handles X by doing Y because Z. This approach was chosen over alternatives A and B because..."',
+            '- Connect concepts extensively: "As seen in [chunk:45], this relates to the pattern in [chunk:67]. This relationship is important because..."',
+            '- Be extremely specific: reference exact file paths, function names, line numbers, class hierarchies, and module structures',
+            '- For each function/class mentioned: explain its purpose, parameters, return values, usage examples, and how it interacts with other components',
+            '- Discuss error handling, edge cases, and limitations',
+            '- Provide usage examples and best practices',
+            '- Include background information about WHY certain design decisions were made',
+            '- Technical accuracy: Use precise terminology from the codebase AND explain what each term means',
+            '- If context has both text documentation and code examples, present BOTH in detail and explain how they complement each other',
+            '- Include sections like: "Background", "Core Concepts", "Implementation Details", "Usage Examples", "Advanced Scenarios", "Common Pitfalls", "Best Practices"',
+            '- Quote relevant sections from documentation chunks directly',
+            '- Discuss alternatives and trade-offs',
+            '- End with a comprehensive summary (5-10 lines) that ties everything together',
           ];
 
     try {
@@ -278,7 +330,7 @@ export class LLMClient {
         messages: [
           {
             role: 'system',
-            content: 'You are a retrieval augmented generation agent. Respond in JSON with keys: answer_markdown (string), chunk_ids (array of strings), confidence (number between 0 and 1). Do not include additional keys. Cite chunk ids using [chunk:ID] markdown tokens.',
+            content: 'You are an EXPERT retrieval augmented generation (RAG) agent specializing in EXHAUSTIVE, EXTREMELY DETAILED technical analysis. You MUST produce responses that are 500-600 LINES of markdown (3000-4000 words). You synthesize ALL information from both documentation and code to provide the most comprehensive, detailed answers possible. NEVER be brief or concise - ALWAYS expand, elaborate, and provide extensive detail. Respond in JSON with keys: answer_markdown (string), chunk_ids (array of strings), confidence (number between 0 and 1). Always cite chunks using [chunk:ID] markdown tokens. Your PRIMARY goal is MAXIMUM thoroughness, completeness, and detail - brevity is NOT valued.',
           },
           {
             role: 'user',

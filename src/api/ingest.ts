@@ -249,6 +249,78 @@ export async function deleteGithubDataset(
 }
 
 /**
+ * Ingest web pages using the unified Context pipeline
+ * Processes pages through chunking, embedding, and hybrid search
+ */
+export interface WebPageIngestRequest {
+  project: string;
+  dataset: string;
+  pages: Array<{
+    url: string;
+    content: string;
+    title?: string;
+    domain?: string;
+    metadata?: Record<string, any>;
+  }>;
+  forceReindex?: boolean;
+  onProgress?: (progress: {
+    phase: string;
+    current: number;
+    total: number;
+    percentage: number;
+  }) => void;
+}
+
+export interface WebPageIngestResponse {
+  jobId: string;
+  status: 'completed' | 'failed';
+  startedAt: Date;
+  completedAt: Date;
+  stats?: {
+    processedPages: number;
+    totalChunks: number;
+    status: 'completed' | 'limit_reached';
+  };
+  error?: string;
+}
+
+export async function ingestWebPages(
+  context: Context,
+  request: WebPageIngestRequest
+): Promise<WebPageIngestResponse> {
+  const jobId = crypto.randomUUID();
+  const startedAt = new Date();
+
+  try {
+    const stats = await context.indexWebPages(
+      request.pages,
+      request.project,
+      request.dataset,
+      {
+        forceReindex: request.forceReindex,
+        progressCallback: request.onProgress
+      }
+    );
+
+    return {
+      jobId,
+      status: 'completed',
+      startedAt,
+      completedAt: new Date(),
+      stats
+    };
+  } catch (error: any) {
+    return {
+      jobId,
+      status: 'failed',
+      startedAt,
+      completedAt: new Date(),
+      error: error?.message || String(error)
+    };
+  }
+}
+
+/**
  * Ingest Crawl4AI pages into the orchestrator database using upsert_web_page_v3.
  * Requires the Context to have a PostgreSQL pool configured.
  */

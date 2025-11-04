@@ -11,6 +11,14 @@ export interface CoreModule {
   smartQueryProject?: (...args: any[]) => Promise<any>;
   ingestGithubRepository: (...args: any[]) => Promise<any>;
   deleteGithubDataset: (...args: any[]) => Promise<any>;
+  // Web content functions
+  ingestWebPages?: (...args: any[]) => Promise<any>;
+  indexWebPages?: (...args: any[]) => Promise<any>;
+  deleteWebDataset?: (...args: any[]) => Promise<any>;
+  deleteDataset?: (...args: any[]) => Promise<any>;
+  queryWebContent?: (...args: any[]) => Promise<any>;
+  smartQueryWebContent?: (...args: any[]) => Promise<any>;
+  smartQueryWeb?: (...args: any[]) => Promise<any>;
 }
 
 let cachedModule: CoreModule | null = null;

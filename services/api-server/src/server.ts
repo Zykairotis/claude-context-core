@@ -16,7 +16,7 @@ async function main() {
   console.log('[Server] Starting API server...');
   console.log(`[Server] Postgres: ${config.postgresUrl.replace(/:[^:]*@/, ':***@')}`);
   console.log(`[Server] Qdrant: ${config.qdrantUrl}`);
-  console.log(`[Server] Crawl4AI: ${config.crawl4aiUrl}`);
+  console.log(`[Server] Crawl4AI: ${config.crawl4aiUrl} (base: ${config.crawl4aiBaseUrl})`);
 
   // Initialize database connection
   const pool = new Pool({
@@ -70,7 +70,7 @@ async function main() {
 
   // Initialize core context and monitors
   const context = initializeContext(pool);
-  const crawlMonitor = new CrawlMonitor();
+  const crawlMonitor = new CrawlMonitor(pool);
   const postgresMonitor = new PostgresMonitor(pool);
   const qdrantMonitor = new QdrantMonitor();
 

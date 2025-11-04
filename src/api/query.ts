@@ -234,11 +234,19 @@ export async function queryProject(
     const hybridEnabled = process.env.ENABLE_HYBRID_SEARCH === 'true' && !!spladeClient?.isEnabled();
     const rerankEnabled = process.env.ENABLE_RERANKING === 'true' && !!rerankerClient;
 
-    onProgress?.('query', 30, 'Generating query embedding');
+    // Check if using dual-model (AutoEmbeddingMonster)
+    const isDualModel = context.isAutoEmbeddingMonster();
+
+    onProgress?.('query', 30, isDualModel ? 'Generating dual-model query embeddings' : 'Generating query embedding');
     const embeddingStart = performance.now();
-    const queryVector = await embedding.embed(request.query);
+    
+    let queryVector: any;
+    if (!isDualModel) {
+      queryVector = await embedding.embed(request.query);
+    }
+    
     const embeddingDuration = performance.now() - embeddingStart;
-    onProgress?.('query', 50, 'Query embedding generated');
+    onProgress?.('query', 50, 'Query embedding(s) generated');
 
     let querySparse: { indices: number[]; values: number[] } | undefined;
     if (hybridEnabled && spladeClient) {
@@ -295,6 +303,26 @@ export async function queryProject(
 
     const executeSearch = async (collectionName: string): Promise<SearchResultWithBreakdown[]> => {
       try {
+        // Dual-model search path
+        if (isDualModel) {
+          const dualResults = await context.dualModelSearch(
+            collectionName,
+            request.query,
+            initialK,
+            threshold,
+            undefined, // filter managed internally
+            hybridEnabled,
+            querySparse
+          );
+
+          return dualResults.map(result => ({
+            document: result.document,
+            score: result.score,
+            vectorScore: result.score
+          }));
+        }
+
+        // Single-model search path
         if (hybridEnabled && querySparse && typeof (vectorDb as any).hybridQuery === 'function') {
           const [hybridResults, denseResults]: [VectorSearchResult[], VectorSearchResult[]] = await Promise.all([
             (vectorDb as any).hybridQuery(collectionName, queryVector.vector, querySparse, {
@@ -560,6 +588,234 @@ export async function queryProject(
       requestId,
       results,
       metadata
+    };
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Query web content with hybrid search support
+ * Combines dense embeddings with SPLADE sparse vectors
+ */
+export interface WebQueryRequest {
+  query: string;
+  project: string;
+  dataset?: string;
+  topK?: number;
+  threshold?: number;
+  includeGlobal?: boolean;
+}
+
+export interface WebQueryResult {
+  id: string;
+  chunk: string;
+  url: string;
+  title?: string;
+  domain?: string;
+  scores: {
+    vector: number;
+    sparse?: number;
+    hybrid?: number;
+    final: number;
+  };
+  metadata?: Record<string, any>;
+}
+
+export interface WebQueryResponse {
+  requestId: string;
+  results: WebQueryResult[];
+  metadata: {
+    retrievalMethod: 'dense' | 'hybrid';
+    queriesExecuted: number;
+    timingMs: {
+      embedding: number;
+      search: number;
+      total: number;
+    };
+    searchParams: {
+      initialK: number;
+      finalK: number;
+      denseWeight?: number;
+      sparseWeight?: number;
+    };
+  };
+}
+
+export async function queryWebContent(
+  context: Context,
+  request: WebQueryRequest
+): Promise<WebQueryResponse> {
+  const requestId = crypto.randomUUID();
+  const startTime = performance.now();
+  const baseTopK = request.topK ?? 10;
+
+  const pool = context.getPostgresPool();
+  if (!pool) {
+    throw new Error('PostgreSQL pool required for web content queries');
+  }
+
+  const client = await pool.connect();
+  try {
+    // Resolve project
+    const projectData = await getOrCreateProject(client, request.project);
+
+    // Get accessible datasets
+    const accessibleDatasetIds = await (async () => {
+      if (request.dataset) {
+        const result = await client.query(
+          'SELECT id FROM claude_context.datasets WHERE project_id = $1 AND name = $2',
+          [projectData.id, request.dataset]
+        );
+        return result.rows.length > 0 ? [result.rows[0].id] : [];
+      }
+      return await (async () => {
+        const result = await client.query(
+          'SELECT id FROM claude_context.datasets WHERE project_id = $1',
+          [projectData.id]
+        );
+        return result.rows.map(row => row.id);
+      })();
+    })();
+
+    if (accessibleDatasetIds.length === 0) {
+      return {
+        requestId,
+        results: [],
+        metadata: {
+          retrievalMethod: 'dense',
+          queriesExecuted: 0,
+          timingMs: { embedding: 0, search: 0, total: 0 },
+          searchParams: { initialK: baseTopK, finalK: baseTopK }
+        }
+      };
+    }
+
+    // Generate query embedding
+    const embeddingStart = performance.now();
+    const embedding = context.getEmbedding();
+    const queryVector = await embedding.embed(request.query);
+    const embeddingDuration = performance.now() - embeddingStart;
+
+    // Check for hybrid search support
+    const spladeClient = context.getSpladeClient();
+    const rerankerClient = context.getRerankerClient();
+    const hybridEnabled = process.env.ENABLE_HYBRID_SEARCH === 'true' && !!spladeClient?.isEnabled();
+    const rerankEnabled = process.env.ENABLE_RERANKING === 'true' && !!rerankerClient;
+
+    let querySparse: { indices: number[]; values: number[] } | undefined;
+    if (hybridEnabled && spladeClient) {
+      try {
+        querySparse = await spladeClient.computeSparse(request.query);
+      } catch (error) {
+        console.warn('[queryWebContent] SPLADE failed, continuing with dense-only:', error);
+      }
+    }
+
+    // Search vector database
+    const searchStart = performance.now();
+    const vectorDb = context.getVectorDatabase();
+    const threshold = request.threshold ?? 0.4;
+    const initialK = rerankEnabled ? parseInt(process.env.RERANK_INITIAL_K || '150', 10) : baseTopK;
+    const finalK = rerankEnabled ? parseInt(process.env.RERANK_FINAL_K || `${baseTopK}`, 10) : baseTopK;
+
+    // Build filter
+    const filter: Record<string, any> = {
+      datasetIds: accessibleDatasetIds,
+      projectId: projectData.id,
+      sourceType: 'web_page'
+    };
+
+    // Execute search
+    let searchResults: VectorSearchResult[] = [];
+    
+    if (hybridEnabled && querySparse && spladeClient?.isEnabled()) {
+      // Hybrid search
+      try {
+        const hybridResults = await (vectorDb as any).hybridQuery?.(
+          `hybrid_web_${projectData.name.toLowerCase()}`,
+          queryVector.vector,
+          querySparse,
+          { topK: initialK, threshold, filter }
+        ) || [];
+        searchResults = hybridResults;
+      } catch (error) {
+        console.warn('[queryWebContent] Hybrid search failed, falling back to dense:', error);
+        searchResults = await vectorDb.search(
+          `web_${projectData.name.toLowerCase()}`,
+          queryVector.vector,
+          { topK: initialK, threshold, filter }
+        );
+      }
+    } else {
+      // Dense-only search
+      searchResults = await vectorDb.search(
+        `web_${projectData.name.toLowerCase()}`,
+        queryVector.vector,
+        { topK: initialK, threshold, filter }
+      );
+    }
+
+    const searchDuration = performance.now() - searchStart;
+
+    // Apply reranking if enabled
+    if (rerankEnabled && rerankerClient && searchResults.length > 0) {
+      const maxChars = parseInt(process.env.RERANK_TEXT_MAX_CHARS || '4000', 10);
+      const candidateTexts = searchResults.map(r => buildRerankText(r.document, maxChars));
+
+      try {
+        const scores = await rerankerClient.rerank(request.query, candidateTexts);
+        searchResults = searchResults
+          .map((result, i) => ({
+            ...result,
+            rerankScore: scores[i] ?? 0
+          }))
+          .sort((a, b) => (b as any).rerankScore - (a as any).rerankScore)
+          .slice(0, finalK);
+      } catch (error) {
+        console.warn('[queryWebContent] Reranking failed, using original scores:', error);
+        searchResults = searchResults.slice(0, finalK);
+      }
+    } else {
+      searchResults = searchResults.slice(0, finalK);
+    }
+
+    // Format results
+    const results: WebQueryResult[] = searchResults.map(result => ({
+      id: result.document.id,
+      chunk: result.document.content,
+      url: result.document.relativePath,
+      title: result.document.metadata?.title,
+      domain: result.document.metadata?.domain,
+      scores: {
+        vector: result.score,
+        sparse: (result as any).sparseScore,
+        hybrid: (result as any).hybridScore,
+        final: (result as any).rerankScore ?? result.score
+      },
+      metadata: result.document.metadata
+    }));
+
+    const totalDuration = performance.now() - startTime;
+
+    return {
+      requestId,
+      results,
+      metadata: {
+        retrievalMethod: hybridEnabled ? 'hybrid' : 'dense',
+        queriesExecuted: 1,
+        timingMs: {
+          embedding: Math.round(embeddingDuration),
+          search: Math.round(searchDuration),
+          total: Math.round(totalDuration)
+        },
+        searchParams: {
+          initialK,
+          finalK,
+          denseWeight: hybridEnabled ? 0.6 : undefined,
+          sparseWeight: hybridEnabled ? 0.4 : undefined
+        }
+      }
     };
   } finally {
     client.release();

@@ -185,10 +185,13 @@ export class PostgresMonitor {
       let totalChunks = 0;
       
       for (const collection of collections.collections) {
-        // Count chunks from hybrid_code_chunks_* collections (GitHub ingestion)
-        // Also count other code chunk collections
+        // Count chunks from all code/content collections:
+        // - hybrid_code_chunks_* (GitHub ingestion)
+        // - code_chunks_* (legacy GitHub)
+        // - project_* (Crawl4AI web ingestion)
         if (collection.name.startsWith('hybrid_code_chunks_') || 
-            collection.name.startsWith('code_chunks_')) {
+            collection.name.startsWith('code_chunks_') ||
+            collection.name.startsWith('project_')) {
           try {
             const info = await this.qdrantClient.getCollection(collection.name);
             totalChunks += info.points_count || 0;

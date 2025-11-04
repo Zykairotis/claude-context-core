@@ -32,7 +32,8 @@ async def crawl_recursive_with_progress(
 
     seed_domains = {normalize_url(url).split("//", 1)[-1].split("/", 1)[0] for url in seed_urls}
 
-    while queue and len(results) < max_pages:
+    # max_pages=0 means unlimited
+    while queue and (max_pages == 0 or len(results) < max_pages):
         if cancel_event and cancel_event.is_set():
             raise asyncio.CancelledError()
 
@@ -57,7 +58,8 @@ async def crawl_recursive_with_progress(
         results.append(page)
         total_processed += 1
         if progress_callback:
-            progress_callback(total_processed, max_pages, page.url)
+            # For unlimited (max_pages=0), report current count without limit
+            progress_callback(total_processed, max_pages if max_pages > 0 else total_processed, page.url)
 
         if depth >= max_depth:
             continue

@@ -7,7 +7,7 @@ import os
 from typing import List, Optional
 
 from qdrant_client import AsyncQdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import Distance, PointStruct, VectorParams, SparseVectorParams, Modifier
 
 
 LOGGER = logging.getLogger(__name__)
@@ -41,16 +41,22 @@ class QdrantVectorStore:
             self.client = None
 
     async def create_collection(self, collection_name: str, dimension: int) -> None:
-        """Create a Qdrant collection."""
+        """Create a Qdrant collection with hybrid search support (named vectors)."""
         if not self.client:
             await self.initialize()
 
         try:
+            # Use named vectors to match TypeScript schema: "vector" for dense, "sparse" for SPLADE
             await self.client.create_collection(
                 collection_name=collection_name,
-                vectors_config=VectorParams(size=dimension, distance=Distance.COSINE),
+                vectors_config={
+                    "vector": VectorParams(size=dimension, distance=Distance.COSINE)
+                },
+                sparse_vectors_config={
+                    "sparse": SparseVectorParams(modifier=Modifier.IDF)
+                },
             )
-            LOGGER.info("Created Qdrant collection %s (%dd)", collection_name, dimension)
+            LOGGER.info("Created Qdrant collection %s (%dd) with hybrid search support", collection_name, dimension)
         except Exception as exc:
             if "already exists" in str(exc).lower():
                 LOGGER.debug("Collection %s already exists", collection_name)
@@ -74,7 +80,9 @@ class QdrantVectorStore:
             points = [
                 PointStruct(
                     id=doc.id,
-                    vector=doc.vector,
+                    vector={
+                        "vector": doc.vector  # Named vector to match TypeScript schema
+                    },
                     payload={
                         "content": doc.content,
                         "relative_path": doc.relative_path,
@@ -109,7 +117,9 @@ class QdrantVectorStore:
             points = [
                 PointStruct(
                     id=chunk.id,
-                    vector=chunk.vector,
+                    vector={
+                        "vector": chunk.vector  # Named vector to match TypeScript schema
+                    },
                     payload={
                         "chunk_text": chunk.chunk_text,
                         "summary": chunk.summary,

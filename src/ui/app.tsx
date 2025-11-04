@@ -306,7 +306,7 @@ export function App(): JSX.Element {
   // Debouncing refs for high-frequency updates
   const lastProgressUpdateRef = React.useRef<number>(0);
   const lastStatsUpdateRef = React.useRef<number>(0);
-  const DEBOUNCE_INTERVAL_MS = 500;
+  const DEBOUNCE_INTERVAL_MS = 250; // Reduced from 500ms for more responsive real-time updates
 
   const client = React.useMemo<ContextClient>(() => {
     return new ContextApiClient({ baseUrl });
@@ -658,7 +658,7 @@ export function App(): JSX.Element {
       project,
       dataset: (formData.get('dataset') as string | null)?.trim() || 'web-pages',
       startUrl,
-      crawlType: (formData.get('crawlType') as CrawlIngestForm['crawlType']) ?? 'breadth-first',
+      crawlType: (formData.get('crawlType') as CrawlIngestForm['crawlType']) ?? 'recursive',
       maxPages: Number(formData.get('maxPages') ?? 25),
       depth: Number(formData.get('depth') ?? 2),
       scope: (formData.get('scope') as ScopeLevel | null) ?? activeScope,
@@ -898,15 +898,15 @@ export function App(): JSX.Element {
                 <GitBranch size={18} /> Ingestion control
               </div>
               <p className="section-summary">
-                Launch GitHub and Crawl4AI jobs with scoped storage routing and recent job insights.
+                Ingest from GitHub repositories or use Crawl4AI web crawler with scoped storage routing and real-time progress tracking.
               </p>
             </div>
             <div className="section-grid">
               <Card>
                 <CardHeader>
-                  <CardTitle>GitHub &amp; Crawl4AI launchpad</CardTitle>
+                  <CardTitle>GitHub & Crawl4AI Launchpad</CardTitle>
                   <CardDescription>
-                    Trigger repository snapshots or web crawls, then monitor queue status and latest job outputs.
+                    Trigger repository snapshots or web crawls with Crawl4AI, then monitor queue status and latest job outputs.
                   </CardDescription>
                 </CardHeader>
                 <CardContent>
@@ -975,10 +975,11 @@ export function App(): JSX.Element {
                           </div>
                           <div>
                             <Label htmlFor="crawl-type">Crawl type</Label>
-                            <Select id="crawl-type" name="crawlType" defaultValue="breadth-first">
-                              <option value="breadth-first">Breadth first</option>
-                              <option value="depth-first">Depth first</option>
-                              <option value="priority">Priority</option>
+                            <Select id="crawl-type" name="crawlType" defaultValue="recursive">
+                              <option value="recursive">Recursive crawl</option>
+                              <option value="batch">Batch crawl</option>
+                              <option value="single">Single page</option>
+                              <option value="sitemap">Sitemap crawl</option>
                             </Select>
                           </div>
                           <div>
@@ -1528,6 +1529,31 @@ export function App(): JSX.Element {
               </p>
             </div>
             <div className="section-grid">
+              {/* WebSocket Connection Status */}
+              <Card style={{ marginBottom: '1rem' }}>
+                <CardHeader>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <CardTitle>Real-time Connection</CardTitle>
+                    <Badge 
+                      variant="outline"
+                      style={{
+                        backgroundColor: isConnected ? '#22c55e20' : '#ef444420',
+                        color: isConnected ? '#22c55e' : '#ef4444',
+                        border: `1px solid ${isConnected ? '#22c55e40' : '#ef444440'}`
+                      }}
+                    >
+                      {connectionStatus === 'connecting' ? 'Connecting...' : 
+                       connectionStatus === 'connected' ? '● Connected' :
+                       connectionStatus === 'error' ? '● Error' :
+                       '○ Disconnected'}
+                    </Badge>
+                  </div>
+                  <CardDescription>
+                    WebSocket connection for live progress updates{lastUpdate ? ` • Last update: ${lastUpdate}` : ''}
+                  </CardDescription>
+                </CardHeader>
+              </Card>
+
               <Card>
                 <CardHeader>
                   <CardTitle>Pipeline telemetry</CardTitle>

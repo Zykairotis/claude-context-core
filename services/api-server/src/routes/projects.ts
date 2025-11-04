@@ -553,7 +553,7 @@ export function createProjectsRouter(pool: Pool, crawlMonitor: CrawlMonitor, wsM
           max_depth: depth || 2,  // 'max_depth' instead of 'depth'
           scope: scope || 'project',
           same_domain_only: true,
-          auto_discovery: true,
+          auto_discovery: false,  // Disable to crawl exact URLs without sitemap redirects
           extract_code_examples: true
         })
       });
@@ -568,8 +568,13 @@ export function createProjectsRouter(pool: Pool, crawlMonitor: CrawlMonitor, wsM
 
       // Track this session for progress monitoring with project/dataset context
       if (sessionId) {
-        crawlMonitor.trackSession(sessionId, project, datasetName);
-        console.log(`[API] Tracking crawl session ${sessionId} for project ${project}, dataset ${datasetName}`);
+        await crawlMonitor.trackSession(sessionId, { 
+          project, 
+          dataset: datasetName,
+          datasetId: datasetId,
+          startUrl: start_url
+        });
+        console.log(`[API] Tracking crawl session ${sessionId} for project ${project}, dataset ${datasetName}, datasetId ${datasetId}`);
       }
 
       res.json({

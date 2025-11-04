@@ -26,7 +26,7 @@ class CrawlRequest(BaseModel):
     urls: List[HttpUrl] = Field(..., description="Seed URLs for the crawl")
     mode: CrawlMode = Field(CrawlMode.SINGLE, description="Crawling strategy to use")
     max_depth: Optional[NonNegativeInt] = Field(1, description="Maximum depth for recursive crawling")
-    max_pages: Optional[NonNegativeInt] = Field(20, description="Maximum pages to fetch")
+    max_pages: Optional[int] = Field(20, ge=0, description="Maximum pages to fetch (0 for unlimited)")
     same_domain_only: bool = Field(True, description="Restrict recursive crawling to the seed domain")
     include_links: bool = Field(False, description="Return discovered links from each page")
     auto_discovery: bool = Field(True, description="Auto-discover llms.txt and sitemaps")

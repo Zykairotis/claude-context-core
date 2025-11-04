@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from fastapi import FastAPI, HTTPException
+
+# Configure logging to show INFO level messages
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 from .crawler import crawler_manager
 from .schemas import (
@@ -47,7 +54,7 @@ async def crawl(request: CrawlRequest) -> CrawlStartResponse:
         urls=[str(url) for url in request.urls],
         auto_discovery=request.auto_discovery,
         max_depth=request.max_depth or 1,
-        max_pages=request.max_pages or 20,
+        max_pages=request.max_pages if request.max_pages is not None else 20,
         same_domain_only=request.same_domain_only,
         include_links=request.include_links,
         extract_code_examples=request.extract_code_examples,
@@ -58,6 +65,7 @@ async def crawl(request: CrawlRequest) -> CrawlStartResponse:
         project=request.project,
         dataset=request.dataset,
         scope=request.scope.value if request.scope else None,
+        max_concurrent=request.max_concurrent,
     )
 
     progress_id = await crawling_service.orchestrate_crawl(context)

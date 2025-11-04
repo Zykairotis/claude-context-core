@@ -31,7 +31,7 @@ class FetchResult:
 class CrawlerManager:
     """Coordinates crawl4ai browser sessions and lightweight HTTP fetches."""
 
-    def __init__(self, *, http_timeout: float = 30.0, browser_concurrency: int = 5):
+    def __init__(self, *, http_timeout: float = 30.0, browser_concurrency: int = 20):
         self.http_timeout = http_timeout
         self.browser_concurrency = browser_concurrency
         self._http_client: Optional[httpx.AsyncClient] = None
@@ -41,7 +41,14 @@ class CrawlerManager:
     async def initialize(self) -> None:
         async with self._init_lock:
             if self._http_client is None:
-                self._http_client = httpx.AsyncClient(timeout=self.http_timeout, follow_redirects=True)
+                # Use HTTP/2 and connection pooling for better parallelism
+                limits = httpx.Limits(max_keepalive_connections=100, max_connections=200)
+                self._http_client = httpx.AsyncClient(
+                    timeout=self.http_timeout, 
+                    follow_redirects=True,
+                    limits=limits,
+                    http2=True  # Enable HTTP/2 for multiplexing
+                )
             if AsyncWebCrawler and self._crawler is None:
                 self._crawler = AsyncWebCrawler(
                     browser_type="chromium",

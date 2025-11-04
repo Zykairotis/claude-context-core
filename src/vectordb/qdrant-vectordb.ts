@@ -646,10 +646,11 @@ export class QdrantVectorDatabase implements VectorDatabase {
     return {
       id: id ?? payload?.id ?? '',
       vector: [],
-      content: payload?.content ?? '',
+      // Support both 'content' (GitHub) and 'chunk_text' (Crawl4AI)
+      content: payload?.content ?? payload?.chunk_text ?? '',
       relativePath: payload?.relative_path ?? payload?.relativePath ?? '',
-      startLine: payload?.start_line ?? payload?.startLine ?? 0,
-      endLine: payload?.end_line ?? payload?.endLine ?? 0,
+      startLine: payload?.start_line ?? payload?.startLine ?? payload?.start_char ?? 0,
+      endLine: payload?.end_line ?? payload?.endLine ?? payload?.end_char ?? 0,
       fileExtension: payload?.file_extension ?? payload?.fileExtension ?? '',
       projectId: payload?.project_id ?? payload?.projectId,
       datasetId: payload?.dataset_id ?? payload?.datasetId,
@@ -657,7 +658,7 @@ export class QdrantVectorDatabase implements VectorDatabase {
       repo: payload?.repo,
       branch: payload?.branch,
       sha: payload?.sha,
-      lang: payload?.lang,
+      lang: payload?.lang ?? payload?.language,
       symbol: payload?.symbol,
       metadata: typeof meta === 'object' ? meta : {}
     };

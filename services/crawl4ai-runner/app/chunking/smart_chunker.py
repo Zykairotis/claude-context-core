@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 from .text_splitter import RecursiveTextSplitter
 from .code_detector import CodeDetector, DetectionResult, Language
+from .markdown_code_extractor import MarkdownCodeExtractor
 
 
 @dataclass
@@ -85,6 +86,7 @@ class SmartChunker:
         self.code_detector = CodeDetector(
             enable_tree_sitter=self.enable_tree_sitter,
         )
+        self.markdown_extractor = MarkdownCodeExtractor()
     
     def chunk_text(
         self,
@@ -94,6 +96,9 @@ class SmartChunker:
     ) -> List[Chunk]:
         """
         Split text into smart chunks with code detection.
+        
+        For markdown content: Extracts code blocks and chunks them separately.
+        For other content: Uses normal chunking with code detection.
         
         Args:
             text: Text to chunk
@@ -106,10 +111,14 @@ class SmartChunker:
         if not text:
             return []
         
-        # Step 1: Split text into overlapping chunks
+        # Step 1: Check if this is markdown with code blocks
+        if self._is_markdown_with_code(text):
+            return self._chunk_markdown_with_code_extraction(text, source_path)
+        
+        # Step 2: Normal chunking for non-markdown or markdown without code
         text_chunks = self.text_splitter.split_text(text)
         
-        # Step 2: Detect code in each chunk
+        # Step 3: Detect code in each chunk
         smart_chunks = []
         
         for idx, text_chunk in enumerate(text_chunks):
@@ -136,6 +145,67 @@ class SmartChunker:
             )
             
             smart_chunks.append(chunk)
+        
+        return smart_chunks
+    
+    def _is_markdown_with_code(self, text: str) -> bool:
+        """Check if text is markdown with fenced code blocks."""
+        # Quick check for markdown code blocks
+        return '```' in text and '\n```' in text
+    
+    def _chunk_markdown_with_code_extraction(
+        self,
+        text: str,
+        source_path: str = "",
+    ) -> List[Chunk]:
+        """
+        Extract code blocks from markdown and chunk them separately.
+        
+        This ensures code blocks are routed to CodeRank and text to GTE.
+        """
+        # Extract markdown segments (text and code)
+        segments = self.markdown_extractor.extract_segments(text)
+        
+        smart_chunks = []
+        chunk_index = 0
+        
+        for segment in segments:
+            if segment.is_code:
+                # Code segment - chunk and route to CodeRank
+                code_text_chunks = self.text_splitter.split_text(segment.content)
+                
+                for text_chunk in code_text_chunks:
+                    chunk = Chunk(
+                        text=text_chunk.text,
+                        is_code=True,
+                        language=segment.language,
+                        start_char=segment.start_pos + text_chunk.start_char,
+                        end_char=segment.start_pos + text_chunk.end_char,
+                        chunk_index=chunk_index,
+                        confidence=1.0,  # Extracted from markdown code block
+                        source_path=source_path,
+                        model_hint="coderank",
+                    )
+                    smart_chunks.append(chunk)
+                    chunk_index += 1
+            else:
+                # Text segment - chunk and route to GTE
+                text_text_chunks = self.text_splitter.split_text(segment.content)
+                
+                for text_chunk in text_text_chunks:
+                    chunk = Chunk(
+                        text=text_chunk.text,
+                        is_code=False,
+                        language="markdown",
+                        start_char=segment.start_pos + text_chunk.start_char,
+                        end_char=segment.start_pos + text_chunk.end_char,
+                        chunk_index=chunk_index,
+                        confidence=1.0,  # Text from markdown
+                        source_path=source_path,
+                        model_hint="gte",
+                    )
+                    smart_chunks.append(chunk)
+                    chunk_index += 1
         
         return smart_chunks
     
