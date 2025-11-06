@@ -217,12 +217,13 @@ class CanonicalMetadataStore:
         if row:
             return row["id"]
 
-        dataset_id = uuid.uuid5(uuid.NAMESPACE_DNS, dataset_name)
+        # Generate deterministic UUID from project + dataset to ensure uniqueness
+        dataset_id = uuid.uuid5(uuid.NAMESPACE_DNS, f"{project_id}:{dataset_name}")
         await conn.execute(
             f"""
             INSERT INTO {self.schema}.datasets (id, project_id, name, status, is_global)
             VALUES ($1::uuid, $2::uuid, $3, 'active', false)
-            ON CONFLICT (project_id, name) DO NOTHING
+            ON CONFLICT (project_id, name) DO UPDATE SET status = 'active'
             """,
             dataset_id,
             project_id,

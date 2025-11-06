@@ -18,7 +18,11 @@ import { envManager } from './utils/env-manager';
 import { getOrCreateProject, getOrCreateDataset } from './utils/project-helpers';
 import { RerankerClient } from './utils/reranker-client';
 import { SpladeClient } from './utils/splade-client';
+import { ScopeManager, ScopeLevel } from './utils/scope-manager';
 import { Pool } from 'pg';
+
+// Re-export ScopeLevel for public API (used in getCollectionNameScoped method signature)
+export { ScopeLevel };
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
@@ -122,6 +126,7 @@ export class Context {
     private readonly chunkStatsEnabled: boolean;
     private rerankerClient?: RerankerClient;
     private spladeClient?: SpladeClient;
+    private scopeManager: ScopeManager;
 
     constructor(config: ContextConfig = {}) {
         this.postgresPool = config.postgresPool;
@@ -183,6 +188,9 @@ export class Context {
         if (process.env.ENABLE_HYBRID_SEARCH === 'true') {
             this.spladeClient = new SpladeClient();
         }
+
+        // Initialize ScopeManager for island architecture
+        this.scopeManager = new ScopeManager();
 
         console.log(`[Context] 🔧 Initialized with ${this.supportedExtensions.length} supported extensions and ${this.ignorePatterns.length} ignore patterns`);
         if (envCustomExtensions.length > 0) {
@@ -290,6 +298,8 @@ export class Context {
 
     /**
      * Generate collection name based on codebase path and hybrid mode
+     * @deprecated Use getCollectionNameScoped() for island architecture support.
+     * This method is kept for backward compatibility with existing MD5-based collections.
      */
     public getCollectionName(codebasePath: string): string {
         const isHybrid = this.getIsHybrid();
@@ -297,6 +307,52 @@ export class Context {
         const hash = crypto.createHash('md5').update(normalizedPath).digest('hex');
         const prefix = isHybrid === true ? 'hybrid_code_chunks' : 'code_chunks';
         return `${prefix}_${hash.substring(0, 8)}`;
+    }
+
+    /**
+     * Generate collection name using ScopeManager (Island Architecture)
+     * 
+     * This is the new recommended method for generating collection names.
+     * It uses the NAME-based approach that matches the Python implementation.
+     * 
+     * Collection naming:
+     * - Global: 'global_knowledge'
+     * - Project: 'project_{sanitized_project_name}'
+     * - Local: 'project_{sanitized_project}_dataset_{sanitized_dataset}'
+     * 
+     * @param project Project name
+     * @param dataset Dataset name
+     * @param scope Optional explicit scope (GLOBAL, PROJECT, LOCAL)
+     * @returns Collection name string
+     * 
+     * @example
+     * ```typescript
+     * // Local scope (default)
+     * context.getCollectionNameScoped('myproject', 'mydataset')
+     * // Returns: "project_myproject_dataset_mydataset"
+     * 
+     * // Project scope
+     * context.getCollectionNameScoped('myproject', 'mydataset', ScopeLevel.PROJECT)
+     * // Returns: "project_myproject"
+     * 
+     * // Global scope
+     * context.getCollectionNameScoped(undefined, undefined, ScopeLevel.GLOBAL)
+     * // Returns: "global_knowledge"
+     * ```
+     */
+    public getCollectionNameScoped(
+        project?: string,
+        dataset?: string,
+        scope?: ScopeLevel
+    ): string {
+        return this.scopeManager.getCollectionName(project, dataset, scope);
+    }
+
+    /**
+     * Get ScopeManager instance for advanced scope operations
+     */
+    public getScopeManager(): ScopeManager {
+        return this.scopeManager;
     }
 
     /**
@@ -931,6 +987,7 @@ export class Context {
                     sparse: sparseVectors?.[index],
                     metadata: {
                         ...restMetadata,
+                        file_path: chunk.metadata.filePath, // Add absolute path for incremental sync
                         codebasePath,
                         language: chunk.metadata.language || 'unknown',
                         chunkIndex
@@ -972,6 +1029,7 @@ export class Context {
                     lang,
                     metadata: {
                         ...restMetadata,
+                        file_path: chunk.metadata.filePath, // Add absolute path for incremental sync
                         codebasePath,
                         language: chunk.metadata.language || 'unknown',
                         chunkIndex
@@ -984,6 +1042,313 @@ export class Context {
         }
     }
 
+    /**
+     * Index web pages with Island Architecture support
+     * 
+     * Phase 6: Uses ScopeManager for collection naming and dataset_collections table
+     */
+    async indexWebPages(
+        pages: Array<{ url: string; content: string; title?: string; metadata?: Record<string, any> }>,
+        project: string,
+        dataset: string,
+        options?: { forceReindex?: boolean; progressCallback?: (progress: any) => void }
+    ): Promise<{ processedPages: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
+        const pool = this.postgresPool;
+        if (!pool) {
+            throw new Error('PostgreSQL pool required for indexWebPages');
+        }
+
+        console.log(`[Context] 🌐 Starting web page indexing for project="${project}", dataset="${dataset}"`);
+        options?.progressCallback?.({ phase: 'Initializing', percentage: 0 });
+
+        const client = await pool.connect();
+        try {
+            // 1. Get or create project and dataset
+            const { getOrCreateProject, getOrCreateDataset } = await import('./utils/project-helpers');
+            const projectRecord = await getOrCreateProject(client, project);
+            const datasetRecord = await getOrCreateDataset(client, projectRecord.id, dataset);
+
+            console.log(`[Context] ✅ Project: ${projectRecord.name} (${projectRecord.id})`);
+            console.log(`[Context] ✅ Dataset: ${datasetRecord.name} (${datasetRecord.id})`);
+
+            // 2. Get collection name using ScopeManager (Phase 6: Island Architecture)
+            const collectionName = this.scopeManager.getCollectionName(project, dataset);
+            console.log(`[Context] 📦 Collection: ${collectionName}`);
+
+            // 3. Get or create collection record in dataset_collections table
+            const { getOrCreateCollectionRecord, updateCollectionMetadata } = await import('./utils/collection-helpers');
+            const collectionId = await getOrCreateCollectionRecord(
+                pool,
+                datasetRecord.id,
+                collectionName,
+                this.vectorDatabase.constructor.name === 'QdrantVectorDatabase' ? 'qdrant' : 'postgres',
+                this.embedding ? await this.embedding.detectDimension() : 768,
+                true // hybrid search enabled
+            );
+
+            console.log(`[Context] ✅ Collection record: ${collectionId}`);
+
+            // 4. Ensure collection exists in vector database
+            if (typeof (this.vectorDatabase as any).hasCollection === 'function') {
+                const exists = await (this.vectorDatabase as any).hasCollection(collectionName);
+                if (!exists) {
+                    console.log(`[Context] 🔨 Creating collection: ${collectionName}`);
+                    if (typeof (this.vectorDatabase as any).createHybridCollection === 'function') {
+                        await (this.vectorDatabase as any).createHybridCollection(
+                            collectionName,
+                            this.embedding ? await this.embedding.detectDimension() : 768
+                        );
+                    } else {
+                        await this.vectorDatabase.createCollection(
+                            collectionName,
+                            this.embedding ? await this.embedding.detectDimension() : 768
+                        );
+                    }
+                }
+            }
+
+            options?.progressCallback?.({ phase: 'Processing pages', percentage: 10 });
+
+            // 5. Process pages and generate chunks
+            let processedPages = 0;
+            let totalChunks = 0;
+            const BATCH_SIZE = 50;
+
+            for (let i = 0; i < pages.length; i++) {
+                const page = pages[i];
+                try {
+                    console.log(`[Context] 📄 Processing page: ${page.title || page.url}`);
+
+                    // Parse markdown content
+                    const { codeBlocks, proseBlocks } = this.parseMarkdownContent(page.content);
+
+                    // Chunk code blocks using AST splitter
+                    const codeChunks: any[] = [];
+                    for (const codeBlock of codeBlocks) {
+                        const language = codeBlock.language || 'typescript';
+                        const chunks = await this.codeSplitter.split(codeBlock.content, language);
+                        codeChunks.push(...chunks.map(chunk => ({
+                            ...chunk,
+                            metadata: {
+                                ...chunk.metadata,
+                                url: page.url,
+                                title: page.title,
+                                isCode: true,
+                                language: codeBlock.language
+                            }
+                        })));
+                    }
+
+                    // Chunk prose using character-based splitting
+                    const proseChunks: any[] = [];
+                    const { CharacterTextSplitter } = await import('@langchain/textsplitters');
+                    const characterSplitter = new CharacterTextSplitter({
+                        chunkSize: 1000,
+                        chunkOverlap: 100,
+                        separator: '\n\n'
+                    });
+
+                    for (const proseBlock of proseBlocks) {
+                        const chunks = await characterSplitter.splitText(proseBlock);
+                        proseChunks.push(...chunks.map(chunk => ({
+                            content: chunk,
+                            metadata: {
+                                url: page.url,
+                                title: page.title,
+                                isCode: false
+                            }
+                        })));
+                    }
+
+                    const allChunks = [...codeChunks, ...proseChunks];
+                    console.log(`[Context] ✂️  Generated ${allChunks.length} chunks (${codeChunks.length} code, ${proseChunks.length} prose)`);
+
+                    // Prepare documents for vector storage
+                    const documents = await this.prepareWebDocuments(
+                        allChunks,
+                        page,
+                        projectRecord.id,
+                        datasetRecord.id
+                    );
+
+                    // Store in batches
+                    for (let j = 0; j < documents.length; j += BATCH_SIZE) {
+                        const batch = documents.slice(j, j + BATCH_SIZE);
+                        
+                        // Store to vector database
+                        if (typeof (this.vectorDatabase as any).insertHybrid === 'function' && this.spladeClient?.isEnabled()) {
+                            await (this.vectorDatabase as any).insertHybrid(collectionName, batch);
+                        } else {
+                            await this.vectorDatabase.insert(collectionName, batch);
+                        }
+                        
+                        totalChunks += batch.length;
+                    }
+
+                    processedPages++;
+                    const progress = Math.round(10 + (processedPages / pages.length) * 85);
+                    options?.progressCallback?.({ phase: `Processed ${processedPages}/${pages.length} pages`, percentage: progress });
+
+                } catch (error) {
+                    console.error(`[Context] ❌ Error processing page ${page.url}:`, error);
+                }
+            }
+
+            // 6. Update collection metadata with final point count
+            await updateCollectionMetadata(pool, collectionName, totalChunks);
+
+            options?.progressCallback?.({ phase: 'Completed', percentage: 100 });
+            console.log(`[Context] ✅ Web page indexing completed! Processed ${processedPages} pages, ${totalChunks} chunks`);
+
+            return {
+                processedPages,
+                totalChunks,
+                status: 'completed'
+            };
+
+        } finally {
+            client.release();
+        }
+    }
+
+    /**
+     * Parse markdown content to separate code blocks from prose
+     */
+    private parseMarkdownContent(markdown: string): {
+        codeBlocks: Array<{ content: string; language: string }>;
+        proseBlocks: string[];
+    } {
+        const codeBlocks: Array<{ content: string; language: string }> = [];
+        const proseBlocks: string[] = [];
+
+        // Regex to match fenced code blocks
+        const codeBlockRegex = /```(\w+)?\n([\s\S]*?)```/g;
+        let lastIndex = 0;
+        let match;
+
+        while ((match = codeBlockRegex.exec(markdown)) !== null) {
+            // Add prose before this code block
+            if (match.index > lastIndex) {
+                const prose = markdown.slice(lastIndex, match.index).trim();
+                if (prose) {
+                    proseBlocks.push(prose);
+                }
+            }
+
+            // Add code block
+            const language = match[1] || 'text';
+            const content = match[2].trim();
+            if (content) {
+                codeBlocks.push({ content, language });
+            }
+
+            lastIndex = match.index + match[0].length;
+        }
+
+        // Add remaining prose after last code block
+        if (lastIndex < markdown.length) {
+            const prose = markdown.slice(lastIndex).trim();
+            if (prose) {
+                proseBlocks.push(prose);
+            }
+        }
+
+        return { codeBlocks, proseBlocks };
+    }
+
+    /**
+     * Prepare web documents for vector storage
+     */
+    private async prepareWebDocuments(
+        chunks: any[],
+        page: { url: string; title?: string; metadata?: Record<string, any> },
+        projectId: string,
+        datasetId: string
+    ): Promise<VectorDocument[]> {
+        const documents: VectorDocument[] = [];
+
+        for (let i = 0; i < chunks.length; i++) {
+            const chunk = chunks[i];
+            const embedding = await this.embedding.embed(chunk.content);
+
+            // Generate sparse vector if SPLADE is available
+            let sparse: { indices: number[]; values: number[] } | undefined;
+            if (this.spladeClient?.isEnabled()) {
+                try {
+                    sparse = await this.spladeClient.computeSparse(chunk.content);
+                } catch (error) {
+                    console.warn('[Context] Failed to compute sparse vector:', error);
+                }
+            }
+
+            const doc: VectorDocument = {
+                id: `web_${projectId}_${datasetId}_${i}_${Date.now()}`,
+                vector: embedding.vector,
+                sparse,
+                content: chunk.content,
+                relativePath: page.url,
+                startLine: 0,
+                endLine: 0,
+                fileExtension: '.md',
+                projectId,
+                datasetId,
+                sourceType: 'web_page',
+                metadata: {
+                    ...chunk.metadata,
+                    title: page.title,
+                    domain: new URL(page.url).hostname,
+                    ...page.metadata
+                }
+            };
+
+            documents.push(doc);
+        }
+
+        return documents;
+    }
+    
+    /**
+     * Store code chunks directly (for incremental sync)
+     */
+    async storeCodeChunks(
+        chunks: any[],
+        project: string,
+        dataset: string,
+        provenance?: { repo?: string; branch?: string; sha?: string }
+    ): Promise<void> {
+        if (chunks.length === 0) return;
+        
+        // Get project and dataset IDs if available
+        const projectContext = {
+            projectId: project, // This should be the ID, not name
+            projectName: project,
+            datasetId: dataset,  // This should be the ID, not name
+            datasetName: dataset
+        };
+        
+        // Prepare chunks in the expected format
+        const codeChunks: CodeChunk[] = chunks.map(chunk => ({
+            content: chunk.content,
+            metadata: {
+                ...chunk.metadata,
+                filePath: chunk.metadata.file_path || chunk.metadata.filePath,
+                startLine: chunk.metadata.start_line || chunk.metadata.startLine || 0,
+                endLine: chunk.metadata.end_line || chunk.metadata.endLine || 0,
+                language: chunk.metadata.language,
+                chunkIndex: chunk.metadata.chunkIndex || 0
+            }
+        }));
+        
+        // Use the existing processChunkBatch method
+        const codebasePath = chunks[0]?.metadata?.codebasePath || '.';
+        await this.processChunkBatch(
+            codeChunks,
+            codebasePath,
+            projectContext,
+            provenance
+        );
+    }
+    
     /**
      * Get programming language based on file extension
      */

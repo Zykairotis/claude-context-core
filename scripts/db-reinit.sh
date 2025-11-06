@@ -182,6 +182,30 @@ run_init_scripts() {
   done
 }
 
+run_migrations() {
+  local migrations_dir="$ROOT_DIR/services/migrations"
+  
+  if [[ ! -d "$migrations_dir" ]]; then
+    say "$YELLOW" "No migrations directory found, skipping migrations."
+    return
+  fi
+
+  local migrations=(
+    "$migrations_dir/web_provenance.sql"
+    "$migrations_dir/mesh_tables.sql"
+  )
+
+  for migration in "${migrations[@]}"; do
+    if [[ ! -f "$migration" ]]; then
+      say "$YELLOW" "Migration not found: $migration (skipping)"
+      continue
+    fi
+
+    say "$YELLOW" "Running migration: $(basename "$migration")"
+    docker exec -i "$POSTGRES_CONTAINER" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" < "$migration"
+  done
+}
+
 clean_qdrant() {
   say "$YELLOW" "Deleting Qdrant collections..."
   if ! command -v jq >/dev/null 2>&1; then
@@ -269,6 +293,7 @@ main() {
   drop_schema
   create_schema_and_extensions
   run_init_scripts
+  run_migrations
 
   clean_qdrant
 

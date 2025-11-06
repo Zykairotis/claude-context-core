@@ -1,4 +1,4 @@
-export type ScopeLevel = 'global' | 'project' | 'local';
+export type UIScopeLevel = 'global' | 'project' | 'local';
 
 export interface ScopeResource {
   name: string;
@@ -32,7 +32,7 @@ export interface IngestionJob {
   source: 'github' | 'crawl';
   project: string;
   dataset: string;
-  scope: ScopeLevel;
+  scope: UIScopeLevel;
   status: 'queued' | 'running' | 'completed' | 'failed';
   startedAt: string;
   duration: string;
@@ -107,7 +107,7 @@ export interface QueryResult {
   sparseScore: number;
   rerankScore: number;
   dataset: string;
-  scope: ScopeLevel;
+  scope: UIScopeLevel;
   why: string;
   chunkTitle?: string;
   repo?: string;
@@ -122,7 +122,7 @@ export interface QueryResult {
 export interface RetrievalSession {
   id: string;
   query: string;
-  scope: ScopeLevel;
+  scope: UIScopeLevel;
   results: QueryResult[];
   startedAt: string;
   latencyMs: number;
@@ -136,7 +136,7 @@ export interface OperationsEvent {
   timestamp: string;
   title: string;
   detail: string;
-  scope: ScopeLevel;
+  scope: UIScopeLevel;
   impact: 'info' | 'success' | 'warning' | 'incident';
 }
 
@@ -167,7 +167,7 @@ export const mockMetricPulses: MetricPulse[] = [
   }
 ];
 
-export const mockScopes: Record<ScopeLevel, ScopeResource[]> = {
+export const mockScopes: Record<UIScopeLevel, ScopeResource[]> = {
   global: [
     {
       name: 'Open Source Playbooks',

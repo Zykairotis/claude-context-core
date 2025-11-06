@@ -5,5 +5,14 @@ module.exports = {
   roots: ['<rootDir>/src'],
   testMatch: ['**/__tests__/**/*.spec.ts'],
   moduleFileExtensions: ['ts', 'js', 'json', 'node'],
-  collectCoverage: false
+  collectCoverage: false,
+  extensionsToTreatAsEsm: ['.ts'],
+  globals: {
+    'ts-jest': {
+      useESM: true,
+    },
+  },
+  transformIgnorePatterns: [
+    'node_modules/(?!(uuid)/)'
+  ]
 };

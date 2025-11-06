@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { Pool, PoolClient } from 'pg';
 import { QdrantClient } from '@qdrant/qdrant-js';
+import * as fs from 'fs';
 import { MetricPulse, PipelinePhase, ScopeResource, ScopeLevel, IngestionJob, OperationsEvent } from '../types';
 import { config } from '../config';
 import { CrawlMonitor } from '../monitors/crawl-monitor';
@@ -760,6 +761,497 @@ export function createProjectsRouter(pool: Pool, crawlMonitor: CrawlMonitor, wsM
     } catch (error: any) {
       console.error('[API] /projects/:project/ingest/github error:', error);
       res.status(500).json({ error: error.message });
+    }
+  });
+
+  // POST /projects/:project/ingest/local
+  router.post('/:project/ingest/local', async (req: Request, res: Response) => {
+    try {
+      const { project } = req.params;
+      const isAllProjects = project.toLowerCase() === 'all';
+
+      if (isAllProjects) {
+        return res.status(400).json({
+          error: 'Cannot ingest to "all" projects. Please specify a concrete project name.'
+        });
+      }
+
+      const { path: codebasePath, dataset, repo, branch, sha, scope } = req.body ?? {};
+      const rawForce = req.body?.force;
+      const force = rawForce === true || rawForce === 'true' || rawForce === 'on' || rawForce === 1 || rawForce === '1';
+
+      if (!codebasePath || typeof codebasePath !== 'string') {
+        return res.status(400).json({ error: 'path is required (absolute path to local codebase)' });
+      }
+
+      // Validate path is absolute
+      if (!codebasePath.startsWith('/')) {
+        return res.status(400).json({ error: 'path must be an absolute path (starting with /)' });
+      }
+
+      const client = await pool.connect();
+      try {
+        // Resolve project and dataset IDs
+        const projectResult = await client.query(
+          'SELECT id FROM claude_context.projects WHERE name = $1',
+          [project]
+        );
+
+        let projectId: string;
+        if (projectResult.rows.length === 0) {
+          // Create project if it doesn't exist
+          const newProject = await client.query(
+            'INSERT INTO claude_context.projects (name, description) VALUES ($1, $2) RETURNING id',
+            [project, `Auto-created for local path: ${codebasePath}`]
+          );
+          projectId = newProject.rows[0].id;
+        } else {
+          projectId = projectResult.rows[0].id;
+        }
+
+        // Use provided dataset name or derive from path
+        const pathBasename = codebasePath.split('/').filter(Boolean).pop() || 'local';
+        const datasetName = dataset || pathBasename;
+        
+        const datasetResult = await client.query(
+          'SELECT id FROM claude_context.datasets WHERE project_id = $1 AND name = $2',
+          [projectId, datasetName]
+        );
+
+        let datasetId: string;
+        if (datasetResult.rows.length === 0) {
+          // Create dataset if it doesn't exist
+          const newDataset = await client.query(
+            'INSERT INTO claude_context.datasets (project_id, name, description, status) VALUES ($1, $2, $3, $4) RETURNING id',
+            [projectId, datasetName, `Local codebase: ${codebasePath}`, 'active']
+          );
+          datasetId = newDataset.rows[0].id;
+        } else {
+          datasetId = datasetResult.rows[0].id;
+        }
+
+        // Call core library directly (synchronous operation)
+        const startTime = Date.now();
+        
+        const progressCallback = (phase: string, percentage: number, detail: string) => {
+          wsManager.broadcast({
+            type: 'web:ingest:progress',
+            project,
+            timestamp: new Date().toISOString(),
+            data: {
+              dataset: datasetName,
+              source: 'local',
+              phase,
+              percentage,
+              detail
+            }
+          });
+        };
+
+        const result = await core.ingestGithubRepository(context, {
+          project,
+          dataset: datasetName,
+          repo: repo || pathBasename,
+          codebasePath,
+          branch,
+          sha,
+          forceReindex: force,
+          onProgress: progressCallback
+        });
+
+        const duration = Date.now() - startTime;
+
+        if (result.status === 'failed') {
+          return res.status(500).json({
+            error: result.error || 'Local ingestion failed',
+            project,
+            dataset: datasetName,
+            path: codebasePath
+          });
+        }
+
+        res.status(200).json({
+          status: 'completed',
+          message: 'Local codebase indexed successfully',
+          project,
+          dataset: datasetName,
+          path: codebasePath,
+          scope: scope || 'project',
+          stats: result.stats,
+          durationMs: duration
+        });
+
+      } finally {
+        client.release();
+      }
+    } catch (error: any) {
+      console.error('[API] /projects/:project/ingest/local error:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // POST /projects/:project/ingest/local/sync - Incremental sync for local codebases
+  router.post('/:project/ingest/local/sync', async (req: Request, res: Response) => {
+    try {
+      const { project } = req.params;
+      const isAllProjects = project.toLowerCase() === 'all';
+
+      if (isAllProjects) {
+        return res.status(400).json({
+          error: 'Cannot sync to "all" projects. Please specify a concrete project name.'
+        });
+      }
+
+      const { path: codebasePath, dataset, force } = req.body ?? {};
+      const forceReindex = force === true || force === 'true' || force === 'on' || force === 1 || force === '1';
+
+      if (!codebasePath || typeof codebasePath !== 'string') {
+        return res.status(400).json({ error: 'path is required (absolute path to local codebase)' });
+      }
+
+      // Validate path is absolute
+      if (!codebasePath.startsWith('/')) {
+        return res.status(400).json({ error: 'Path must be an absolute path (starting with /)' });
+      }
+
+      // Check if path exists
+      if (!fs.existsSync(codebasePath)) {
+        return res.status(400).json({ error: `Path does not exist: ${codebasePath}` });
+      }
+
+      const client = await pool.connect();
+      try {
+        // Resolve project and dataset IDs
+        const projectResult = await client.query(
+          'SELECT id FROM claude_context.projects WHERE name = $1',
+          [project]
+        );
+
+        let projectId: string;
+        if (projectResult.rows.length === 0) {
+          // Create project if it doesn't exist
+          const newProject = await client.query(
+            'INSERT INTO claude_context.projects (name, description) VALUES ($1, $2) RETURNING id',
+            [project, `Auto-created for local sync: ${codebasePath}`]
+          );
+          projectId = newProject.rows[0].id;
+        } else {
+          projectId = projectResult.rows[0].id;
+        }
+
+        // Use provided dataset name or derive from path
+        const pathBasename = codebasePath.split('/').filter(Boolean).pop() || 'local';
+        const datasetName = dataset || pathBasename;
+        
+        const datasetResult = await client.query(
+          'SELECT id FROM claude_context.datasets WHERE project_id = $1 AND name = $2',
+          [projectId, datasetName]
+        );
+
+        let datasetId: string;
+        if (datasetResult.rows.length === 0) {
+          // Create dataset if it doesn't exist
+          const newDataset = await client.query(
+            'INSERT INTO claude_context.datasets (project_id, name, description, status) VALUES ($1, $2, $3, $4) RETURNING id',
+            [projectId, datasetName, `Local codebase sync: ${codebasePath}`, 'active']
+          );
+          datasetId = newDataset.rows[0].id;
+        } else {
+          datasetId = datasetResult.rows[0].id;
+        }
+
+        // Import sync functionality
+        const { incrementalSync } = await import('../../../../dist/sync/index.js');
+        
+        // Progress callback for WebSocket updates
+        const progressCallback = (progress: any) => {
+          wsManager.broadcast({
+            type: 'web:ingest:progress',
+            project,
+            timestamp: new Date().toISOString(),
+            data: {
+              dataset: datasetName,
+              source: 'local-sync',
+              phase: progress.phase,
+              percentage: progress.percentage,
+              current: progress.current,
+              total: progress.total,
+              file: progress.file,
+              detail: progress.detail
+            }
+          });
+        };
+
+        // Run incremental sync
+        const startTime = Date.now();
+        const stats = await incrementalSync(
+          context,
+          pool,
+          codebasePath,
+          project,
+          projectId,
+          datasetName,
+          datasetId,
+          {
+            force: forceReindex,
+            detectRenames: true,
+            progressCallback
+          }
+        );
+
+        // Prepare change details for response
+        const changes = {
+          created: stats.filesCreated > 0 ? `${stats.filesCreated} file(s) indexed` : undefined,
+          modified: stats.filesModified > 0 ? `${stats.filesModified} file(s) updated` : undefined,
+          deleted: stats.filesDeleted > 0 ? `${stats.filesDeleted} file(s) removed` : undefined,
+          renamed: stats.filesRenamed > 0 ? `${stats.filesRenamed} file(s) renamed` : undefined
+        };
+
+        res.status(200).json({
+          status: 'completed',
+          message: forceReindex ? 'Full reindex completed' : 'Incremental sync completed',
+          project,
+          dataset: datasetName,
+          path: codebasePath,
+          stats: {
+            filesScanned: stats.filesScanned,
+            filesCreated: stats.filesCreated,
+            filesModified: stats.filesModified,
+            filesDeleted: stats.filesDeleted,
+            filesRenamed: stats.filesRenamed,
+            filesUnchanged: stats.filesUnchanged,
+            chunksAdded: stats.chunksAdded,
+            chunksRemoved: stats.chunksRemoved,
+            chunksUnchanged: stats.chunksUnchanged,
+            durationMs: stats.durationMs,
+            scanDurationMs: stats.scanDurationMs,
+            syncDurationMs: stats.syncDurationMs
+          },
+          changes: Object.keys(changes).reduce((acc, key) => {
+            if (changes[key as keyof typeof changes]) {
+              acc[key] = changes[key as keyof typeof changes];
+            }
+            return acc;
+          }, {} as any)
+        });
+
+      } finally {
+        client.release();
+      }
+    } catch (error: any) {
+      console.error('[API] /projects/:project/ingest/local/sync error:', error);
+      res.status(500).json({ 
+        error: error.message,
+        project: req.params.project,
+        dataset: req.body?.dataset,
+        path: req.body?.path
+      });
+    }
+  });
+
+  // POST /projects/:project/watch/start - Start watching a local directory
+  router.post('/:project/watch/start', async (req: Request, res: Response) => {
+    try {
+      const { project } = req.params;
+      const { path: codebasePath, dataset } = req.body;
+
+      if (!codebasePath) {
+        return res.status(400).json({ error: 'path is required' });
+      }
+
+      if (!fs.existsSync(codebasePath)) {
+        return res.status(400).json({ error: `Path does not exist: ${codebasePath}` });
+      }
+
+      const client = await pool.connect();
+      try {
+        // Get or create project
+        const projectResult = await client.query(
+          'SELECT id FROM claude_context.projects WHERE name = $1',
+          [project]
+        );
+        
+        let projectId: string;
+        if (projectResult.rows.length === 0) {
+          const newProject = await client.query(
+            'INSERT INTO claude_context.projects (name, description) VALUES ($1, $2) RETURNING id',
+            [project, `Auto-created for watch: ${codebasePath}`]
+          );
+          projectId = newProject.rows[0].id;
+        } else {
+          projectId = projectResult.rows[0].id;
+        }
+
+        // Get or create dataset
+        const datasetName = dataset || codebasePath.split('/').pop() || 'default';
+        const datasetResult = await client.query(
+          'SELECT id FROM claude_context.datasets WHERE project_id = $1 AND name = $2',
+          [projectId, datasetName]
+        );
+        
+        let datasetId: string;
+        if (datasetResult.rows.length === 0) {
+          const newDataset = await client.query(
+            'INSERT INTO claude_context.datasets (project_id, name, description) VALUES ($1, $2, $3) RETURNING id',
+            [projectId, datasetName, `Auto-watch: ${codebasePath}`]
+          );
+          datasetId = newDataset.rows[0].id;
+        } else {
+          datasetId = datasetResult.rows[0].id;
+        }
+
+        // Import watcher
+        const { startWatching, isWatching } = await import('../../../../dist/sync/index.js');
+        
+        // Check if already watching
+        if (isWatching(codebasePath, project, datasetName)) {
+          return res.status(400).json({
+            error: 'Already watching this path',
+            path: codebasePath,
+            project,
+            dataset: datasetName
+          });
+        }
+
+        // Start watching with progress callback
+        const watcher = await startWatching(
+          context,
+          pool,
+          codebasePath,
+          project,
+          projectId,
+          datasetName,
+          datasetId,
+          {
+            debounceMs: 2000,
+            onSync: (stats) => {
+              wsManager.broadcast({
+                type: 'watch:sync',
+                project,
+                timestamp: new Date().toISOString(),
+                data: {
+                  path: codebasePath,
+                  dataset: datasetName,
+                  stats
+                }
+              });
+            },
+            onError: (error) => {
+              wsManager.broadcast({
+                type: 'watch:error',
+                project,
+                timestamp: new Date().toISOString(),
+                data: {
+                  path: codebasePath,
+                  error: error.message
+                }
+              });
+            },
+            onEvent: (event, path) => {
+              wsManager.broadcast({
+                type: 'watch:event',
+                project,
+                timestamp: new Date().toISOString(),
+                data: {
+                  event,
+                  path
+                }
+              });
+            }
+          }
+        );
+
+        res.json({
+          status: 'watching',
+          message: `Started watching ${codebasePath}`,
+          project,
+          dataset: datasetName,
+          path: codebasePath,
+          watcherId: watcher.id,
+          startedAt: watcher.startedAt
+        });
+
+      } finally {
+        client.release();
+      }
+    } catch (error: any) {
+      console.error('[API] /projects/:project/watch/start error:', error);
+      res.status(500).json({ 
+        error: error.message,
+        project: req.params.project,
+        path: req.body?.path
+      });
+    }
+  });
+
+  // POST /projects/:project/watch/stop - Stop watching a directory
+  router.post('/:project/watch/stop', async (req: Request, res: Response) => {
+    try {
+      const { project } = req.params;
+      const { path: codebasePath, dataset } = req.body;
+
+      if (!codebasePath) {
+        return res.status(400).json({ error: 'path is required' });
+      }
+
+      const { stopWatching } = await import('../../../../dist/sync/index.js');
+      
+      const datasetName = dataset || codebasePath.split('/').pop() || 'default';
+      const stopped = await stopWatching(codebasePath, project, datasetName);
+
+      if (stopped) {
+        res.json({
+          status: 'stopped',
+          message: `Stopped watching ${codebasePath}`,
+          project,
+          dataset: datasetName,
+          path: codebasePath
+        });
+      } else {
+        res.status(404).json({
+          error: 'Watcher not found',
+          path: codebasePath,
+          project,
+          dataset: datasetName
+        });
+      }
+    } catch (error: any) {
+      console.error('[API] /projects/:project/watch/stop error:', error);
+      res.status(500).json({ 
+        error: error.message,
+        project: req.params.project,
+        path: req.body?.path
+      });
+    }
+  });
+
+  // GET /projects/:project/watch/list - List active watchers
+  router.get('/:project/watch/list', async (req: Request, res: Response) => {
+    try {
+      const { project } = req.params;
+      const { getActiveWatchers } = await import('../../../../dist/sync/index.js');
+      
+      const allWatchers = getActiveWatchers();
+      const projectWatchers = allWatchers.filter(w => w.project === project);
+
+      res.json({
+        project,
+        watchers: projectWatchers.map(w => ({
+          id: w.id,
+          path: w.path,
+          dataset: w.dataset,
+          startedAt: w.startedAt,
+          lastSyncAt: w.lastSyncAt,
+          syncCount: w.syncCount
+        })),
+        count: projectWatchers.length
+      });
+    } catch (error: any) {
+      console.error('[API] /projects/:project/watch/list error:', error);
+      res.status(500).json({ 
+        error: error.message,
+        project: req.params.project
+      });
     }
   });
 

@@ -101,6 +101,32 @@ Use this to fully reset the environment before populating new data.
 
 ---
 
+## `migrate-add-indexed-files.sh`
+
+Add the `indexed_files` table for incremental sync feature. This enables fast, efficient updates to indexed codebases by tracking file changes using SHA256 hashing.
+
+```
+./scripts/migrate-add-indexed-files.sh
+```
+
+### What It Does
+- Creates `claude_context.indexed_files` table
+- Adds indexes for fast lookups (file path, hash, dataset)
+- Creates timestamp trigger for `updated_at` column
+- Verifies migration succeeded
+- Shows table structure and information
+
+### When to Use
+- After upgrading to a version with incremental sync support
+- Before using `claudeContext.syncLocal` tool
+- First-time setup for local indexing optimization
+
+**Note:** This is a one-time migration. Subsequent runs will detect the table already exists.
+
+See [`docs/INCREMENTAL-SYNC.md`](../docs/INCREMENTAL-SYNC.md) for complete documentation.
+
+---
+
 ## Examples
 
 ```bash
@@ -118,6 +144,9 @@ Use this to fully reset the environment before populating new data.
 
 # Nuclear option: drop volumes and recreate containers
 ./scripts/db-reinit.sh --with-containers --force
+
+# Add incremental sync support (one-time migration)
+./scripts/migrate-add-indexed-files.sh
 ```
 
 ---

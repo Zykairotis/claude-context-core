@@ -1,0 +1,19 @@
+version: "3.9"
+services:
+  cognee:
+    image: cognee/cognee:main
+    container_name: cognee
+    ports:
+      - "8340:8000"        # host:container
+    env_file:
+      - ./.env             # load environment variables from .env
+    stdin_open: true       # equivalent to -it
+    tty: true
+    restart: unless-stopped
+    networks:
+      - embedding-network
+
+networks:
+  embedding-network:
+    external: true
+    name: embedding-network

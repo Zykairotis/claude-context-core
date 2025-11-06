@@ -48,7 +48,7 @@ import type {
   OperationsEvent,
   PipelinePhase,
   RetrievalSession,
-  ScopeLevel,
+  UIScopeLevel,
   ScopeResource
 } from './data/mock-dashboard';
 import { useWebSocket } from './hooks/useWebSocket';
@@ -94,7 +94,7 @@ const SMART_STRATEGIES: Array<{ id: SmartStrategy; label: string; description: s
   }
 ];
 
-function scopeLabel(scope: ScopeLevel): string {
+function scopeLabel(scope: UIScopeLevel): string {
   switch (scope) {
     case 'global':
       return 'Global';
@@ -178,8 +178,8 @@ export function App(): JSX.Element {
     metrics: MetricPulse[];
     pipeline: PipelinePhase[];
   }>({ project, metrics: [], pipeline: [] });
-  const [scopeResources, setScopeResources] = React.useState<Record<ScopeLevel, ScopeResource[]>>({ global: [], project: [], local: [] });
-  const [activeScope, setActiveScope] = React.useState<ScopeLevel>('project');
+  const [scopeResources, setScopeResources] = React.useState<Record<UIScopeLevel, ScopeResource[]>>({ global: [], project: [], local: [] });
+  const [activeScope, setActiveScope] = React.useState<UIScopeLevel>('project');
   const [ingestionJobs, setIngestionJobs] = React.useState<IngestionJob[]>([]);
   const [retrievalHistory, setRetrievalHistory] = React.useState<RetrievalSession[]>([]);
   const [operations, setOperations] = React.useState<OperationsEvent[]>([]);
@@ -397,7 +397,7 @@ export function App(): JSX.Element {
                   source: 'crawl' as const,
                   project: crawl.project,
                   dataset: crawl.dataset,
-                  scope: 'project' as ScopeLevel,
+                  scope: 'project' as UIScopeLevel,
                   status: crawl.status as any,
                   startedAt: new Date().toLocaleTimeString(),
                   duration: `${Math.round(crawl.durationMs / 1000)}s`,
@@ -619,7 +619,7 @@ export function App(): JSX.Element {
       dataset: (formData.get('dataset') as string | null)?.trim() || undefined,
       branch: (formData.get('branch') as string | null)?.trim() || undefined,
       sha: (formData.get('sha') as string | null)?.trim() || undefined,
-      scope: (formData.get('scope') as ScopeLevel | null) ?? activeScope,
+      scope: (formData.get('scope') as UIScopeLevel | null) ?? activeScope,
       includeGlobal: formData.get('includeGlobal') === 'on',
       force: formData.get('force') === 'on'
     };
@@ -661,7 +661,7 @@ export function App(): JSX.Element {
       crawlType: (formData.get('crawlType') as CrawlIngestForm['crawlType']) ?? 'recursive',
       maxPages: Number(formData.get('maxPages') ?? 25),
       depth: Number(formData.get('depth') ?? 2),
-      scope: (formData.get('scope') as ScopeLevel | null) ?? activeScope,
+      scope: (formData.get('scope') as UIScopeLevel | null) ?? activeScope,
       force: formData.get('force') === 'on'
     };
 
@@ -1450,13 +1450,13 @@ export function App(): JSX.Element {
                   </CardDescription>
                 </CardHeader>
                 <CardContent>
-                  <Tabs value={activeScope} onValueChange={(value) => setActiveScope(value as ScopeLevel)}>
+                  <Tabs value={activeScope} onValueChange={(value) => setActiveScope(value as UIScopeLevel)}>
                     <TabsList>
                       <TabsTrigger value="global">Global</TabsTrigger>
                       <TabsTrigger value="project">Project</TabsTrigger>
                       <TabsTrigger value="local">Local</TabsTrigger>
                     </TabsList>
-                    {(['global', 'project', 'local'] as ScopeLevel[]).map((scope) => (
+                    {(['global', 'project', 'local'] as UIScopeLevel[]).map((scope) => (
                       <TabsContent value={scope} key={scope}>
                         <div className="timeline">
                           {(scopeResources[scope] ?? []).map((resource) => (

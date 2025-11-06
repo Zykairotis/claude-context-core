@@ -10,11 +10,12 @@ from typing import Any, Optional
 import httpx
 
 try:  # pragma: no cover - optional dependency during tests
-    from crawl4ai import AsyncWebCrawler, CacheMode, CrawlerRunConfig
+    from crawl4ai import AsyncWebCrawler, CacheMode, CrawlerRunConfig, MemoryAdaptiveDispatcher
 except ImportError:  # pragma: no cover
     AsyncWebCrawler = None  # type: ignore
     CacheMode = None  # type: ignore
     CrawlerRunConfig = None  # type: ignore
+    MemoryAdaptiveDispatcher = None  # type: ignore
 
 
 LOGGER = logging.getLogger(__name__)
@@ -120,6 +121,39 @@ class CrawlerManager:
             "timings": getattr(result, "timings", {}),
         }
         return FetchResult(final_url=final_url, html=html, status_code=status, metadata=metadata)
+
+    async def crawl_many(
+        self,
+        urls: list[str],
+        *,
+        config: Optional[Any] = None,
+        dispatcher: Optional[Any] = None,
+    ):
+        """
+        Crawl multiple URLs in parallel using crawl4ai's arun_many.
+        
+        Args:
+            urls: List of URLs to crawl
+            config: Optional CrawlerRunConfig
+            dispatcher: Optional MemoryAdaptiveDispatcher for memory management
+            
+        Returns:
+            Async iterator of crawl results
+        """
+        if not AsyncWebCrawler:
+            LOGGER.error("crawl4ai is unavailable; cannot use parallel crawling")
+            return
+            
+        if self._crawler is None:
+            await self.initialize()
+            
+        # arun_many returns a coroutine that yields an async generator
+        # We need to await it first, then iterate
+        batch_results = await self._crawler.arun_many(urls=urls, config=config, dispatcher=dispatcher)
+        
+        # Now iterate over the async generator
+        async for result in batch_results:
+            yield result
 
 
 crawler_manager = CrawlerManager()

@@ -9,7 +9,7 @@ export {
   type ShareResourceRequest
 } from './api/client';
 export {
-  type ScopeLevel,
+  type UIScopeLevel,
   type ScopeResource,
   type IngestionJob,
   type QueryResult,

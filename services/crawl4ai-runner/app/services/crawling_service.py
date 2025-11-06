@@ -25,6 +25,7 @@ from .code_extraction_service import (
 )
 from .discovery_service import DiscoveredFile, DiscoveryService
 from .minimax_summary_provider import MiniMaxSummaryProvider
+from .progress_mapper import ProgressMapper
 from .streaming_pipeline import StreamingPipeline
 
 from ..storage import (
@@ -77,13 +78,15 @@ class ProgressState:
     project: Optional[str] = None
     dataset: Optional[str] = None
     # Real-time progress tracking fields
-    current_phase: str = "idle"
+    current_phase: str = "initializing"
     phase_detail: Optional[str] = None
     chunks_total: int = 0
     chunks_processed: int = 0
     summaries_generated: int = 0
     embeddings_generated: int = 0
     last_progress_percentage: int = 0
+    # Progress mapper for smooth transitions
+    progress_mapper: ProgressMapper = field(default_factory=ProgressMapper)
 
 
 @dataclass
@@ -139,31 +142,45 @@ class CrawlingService:
         try:
             await self.crawler.initialize()
 
+            # Phase 1: Initialization (0-5%)
+            self._update_progress(progress_id, log="Initializing crawler", current_phase="initializing", phase_detail="Setup")
+            
             urls = [ensure_https(url) for url in ctx.urls]
+            
+            # Phase 2: Discovery (5-15%)
             discovered: Optional[DiscoveredFile] = None
             if ctx.auto_discovery:
-                self._update_progress(progress_id, progress=5, log="Running discovery", current_phase="crawling", phase_detail="Auto-discovery")
+                self._update_progress(progress_id, log="Running auto-discovery", current_phase="discovery", phase_detail="Searching for llms.txt, sitemaps")
                 discovered = await self.discovery.discover_files(urls)
-                self._update_progress(
-                    progress_id, progress=15, log="Discovery complete", current_phase="crawling", phase_detail="Discovery complete"
-                )
+                if discovered:
+                    self._update_progress(
+                        progress_id, log=f"Discovery found: {discovered.url}", current_phase="discovery", phase_detail="Complete"
+                    )
+                else:
+                    self._update_progress(
+                        progress_id, log="No discovery files found", current_phase="discovery", phase_detail="Complete"
+                    )
 
             crawl_urls = await self._determine_urls(ctx, urls, discovered)
             state.total_pages = len(crawl_urls)
+            
+            # Phase 3: Crawling (15-60%)
             self._update_progress(
-                progress_id, progress=20, log="Starting crawl", current_url=None, current_phase="crawling", phase_detail="Fetching pages"
+                progress_id, log=f"Starting crawl of {len(crawl_urls)} URL(s)", current_url=None, current_phase="crawling", phase_detail="Fetching pages"
             )
 
-            # Phase 3: Crawling & Processing (20-98%)
-            if PROCESSING_MODE == "hybrid" and (ctx.project or ctx.dataset):
-                # Hybrid: Process pages as they complete
+            # Phase 3-7: Crawling & Processing (15-98%)
+            # NOTE: Hybrid mode doesn't support recursive crawling - use sequential for that
+            LOGGER.info(f"Processing mode check: PROCESSING_MODE={PROCESSING_MODE}, ctx.mode={ctx.mode}, ctx.project={ctx.project}, ctx.dataset={ctx.dataset}")
+            if PROCESSING_MODE == "hybrid" and (ctx.project or ctx.dataset) and ctx.mode != CrawlMode.RECURSIVE:
+                LOGGER.info("Using HYBRID mode for crawling")
                 await self._hybrid_crawl_and_process(progress_id, ctx, crawl_urls)
-                self._update_progress(progress_id, progress=98, log="Hybrid processing complete", current_phase="completed", phase_detail="Success")
+                self._update_progress(progress_id, log="Hybrid processing complete", current_phase="storing", phase_detail="Complete")
             else:
-                # Sequential: Crawl all then process all
+                LOGGER.info(f"Using SEQUENTIAL mode for crawling (mode={ctx.mode})")
                 documents = await self._execute_crawl(progress_id, ctx, crawl_urls)
                 state.documents = documents
-                self._update_progress(progress_id, progress=60, log="Crawling complete", current_phase="crawling", phase_detail="Complete")
+                self._update_progress(progress_id, log=f"Crawling complete: {len(documents)} pages", current_phase="crawling", phase_detail="Complete")
 
                 # Phase 4-7: Chunking, Summarization, Embedding, Storage
                 if documents and (ctx.project or ctx.dataset):
@@ -174,7 +191,7 @@ class CrawlingService:
                         LOGGER.error("Chunking failed, using fallback: %s", exc)
                         chunks = []  # Continue with empty chunks
                         self._update_progress(
-                            progress_id, progress=70, log=f"Chunking failed: {exc}", current_phase="chunking", phase_detail="Failed"
+                            progress_id, log=f"Chunking failed: {exc}", current_phase="chunking", phase_detail="Failed"
                         )
 
                     # Phase 5: Summarization (70-80%)
@@ -190,7 +207,7 @@ class CrawlingService:
                             chunk.text[:100] + "..." for chunk in chunks
                         ]  # Fallback
                         self._update_progress(
-                            progress_id, progress=80, log=f"Summarization failed: {exc}", current_phase="summarizing", phase_detail="Failed"
+                            progress_id, log=f"Summarization failed: {exc}", current_phase="summarizing", phase_detail="Failed"
                         )
 
                     # Phase 6: Embedding (80-92%)
@@ -202,7 +219,7 @@ class CrawlingService:
                         LOGGER.error("Embedding failed: %s", exc)
                         embeddings = []
                         self._update_progress(
-                            progress_id, progress=92, log=f"Embedding failed: {exc}", current_phase="embedding", phase_detail="Failed"
+                            progress_id, log=f"Embedding failed: {exc}", current_phase="embedding", phase_detail="Failed"
                         )
 
                     # Phase 7: Storage (92-98%)
@@ -215,7 +232,6 @@ class CrawlingService:
                             state.chunks_stored = chunks_stored
                             self._update_progress(
                                 progress_id,
-                                progress=98,
                                 log=f"Stored {chunks_stored} chunks",
                                 current_phase="storing",
                                 phase_detail="Complete"
@@ -223,7 +239,6 @@ class CrawlingService:
                         else:
                             self._update_progress(
                                 progress_id,
-                                progress=98,
                                 log="Skipped storage (no valid data)",
                                 current_phase="storing",
                                 phase_detail="Skipped"
@@ -231,11 +246,12 @@ class CrawlingService:
                     except Exception as exc:
                         LOGGER.error("Storage failed: %s", exc)
                         self._update_progress(
-                            progress_id, progress=98, log=f"Storage failed: {exc}", current_phase="storing", phase_detail="Failed"
+                            progress_id, log=f"Storage failed: {exc}", current_phase="storing", phase_detail="Failed"
                         )
 
+            # Phase 8: Completion (98-100%)
             self._update_progress(
-                progress_id, progress=100, status="completed", log="Crawl finished", current_phase="completed", phase_detail="Success"
+                progress_id, status="completed", log="Crawl finished successfully", current_phase="completed", phase_detail="Success"
             )
         except asyncio.CancelledError:
             self._update_progress(
@@ -440,7 +456,8 @@ class CrawlingService:
 
         mode = ctx.mode
 
-        if mode == CrawlMode.SINGLE or len(urls) == 1:
+        # Handle SINGLE mode explicitly (don't force it based on URL count)
+        if mode == CrawlMode.SINGLE:
             page = await crawl_single_page(
                 self.crawler,
                 urls[0],
@@ -1171,19 +1188,45 @@ class CrawlingService:
         chunks_processed: Optional[int] = None,
         chunks_total: Optional[int] = None,
     ) -> None:
+        """Update progress state with smooth phase transitions."""
         state = self._states.get(progress_id)
         if not state:
             return
-        if progress is not None:
-            state.progress = max(state.progress, progress)
+        
+        # Use progress mapper for smooth transitions
+        if current_phase:
+            if progress is not None:
+                # Explicit progress value provided
+                mapped_progress = state.progress_mapper.map_progress(
+                    current_phase, progress
+                )
+            else:
+                # No explicit progress - use phase defaults
+                # Map 0% within phase to get phase start value
+                mapped_progress = state.progress_mapper.map_progress(
+                    current_phase, 0
+                )
+            state.progress = mapped_progress
+            state.current_phase = current_phase
+        elif progress is not None:
+            # Progress without phase - use mapper with current phase
+            mapped_progress = state.progress_mapper.map_progress(
+                state.current_phase, progress
+            )
+            state.progress = mapped_progress
+        
+        # Update other fields
         if status is not None:
             state.status = status
+            # Force completion progress
+            if status == "completed":
+                state.progress = state.progress_mapper.map_progress(
+                    "completed", 100, force_value=100
+                )
         if log is not None:
             state.log = log
         if current_url is not None:
             state.current_url = current_url
-        if current_phase is not None:
-            state.current_phase = current_phase
         if phase_detail is not None:
             state.phase_detail = phase_detail
         if chunks_processed is not None:

@@ -637,6 +637,81 @@ export class PostgresDualVectorDatabase implements VectorDatabase {
   }
 
   /**
+   * Delete documents by file path with optional project/dataset filters
+   */
+  async deleteByFilePath(
+    collectionName: string,
+    relativePath: string,
+    projectId?: string,
+    datasetId?: string
+  ): Promise<number> {
+    const client = await this.pool.connect();
+    const tableName = this.getTableName(collectionName);
+
+    try {
+      await client.query('BEGIN');
+
+      // Build WHERE clause with filters
+      const conditions: string[] = ['relative_path = $1'];
+      const params: any[] = [relativePath];
+      let paramIndex = 2;
+
+      if (projectId) {
+        conditions.push(`project_id = $${paramIndex}`);
+        params.push(projectId);
+        paramIndex++;
+      }
+
+      if (datasetId) {
+        conditions.push(`dataset_id = $${paramIndex}`);
+        params.push(datasetId);
+        paramIndex++;
+      }
+
+      const whereClause = conditions.join(' AND ');
+
+      const result = await client.query(
+        `DELETE FROM ${tableName}
+         WHERE ${whereClause}
+         RETURNING id`,
+        params
+      );
+      const deletedCount = result.rowCount ?? 0;
+
+      if (deletedCount > 0) {
+        await client.query(
+          `UPDATE ${this.schema}.collections_metadata 
+           SET entity_count = (SELECT COUNT(*) FROM ${tableName}),
+               updated_at = CURRENT_TIMESTAMP
+           WHERE collection_name = $1`,
+          [collectionName]
+        );
+      }
+
+      await client.query('COMMIT');
+
+      if (deletedCount > 0) {
+        console.log(`[PostgresDualVectorDB] 🗑️  Deleted ${deletedCount} chunks for file ${relativePath} in ${collectionName}`);
+      }
+
+      return deletedCount;
+    } catch (error: any) {
+      await client.query('ROLLBACK');
+
+      // Ignore missing relation errors (collection not materialized yet)
+      if (error?.code === '42P01') {
+        console.warn(`[PostgresDualVectorDB] ⚠️  Collection ${collectionName} not found while deleting ${relativePath}`);
+        return 0;
+      }
+
+      console.error(`[PostgresDualVectorDB] ❌ Failed to delete file chunks for ${relativePath}:`, error);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
    * Query documents with filter
    */
   async query(

@@ -62,7 +62,13 @@ describe('Context.indexWebPages', () => {
 
     // Mock PostgreSQL pool
     mockPool = {
-      connect: jest.fn(async () => mockPoolClient)
+      connect: jest.fn(async () => mockPoolClient),
+      query: jest.fn(async (sql: string) => {
+        if (sql.includes('dataset_collections')) {
+          return { rows: [{ id: 'collection-123' }] };
+        }
+        return { rows: [] };
+      })
     } as any;
 
     // Create context with mocks
@@ -132,7 +138,8 @@ More text.
     const stats = await context.indexWebPages(pages, 'test-project', 'test-dataset');
 
     expect(stats.processedPages).toBe(1);
-    expect(mockVectorDb.insertHybrid).toHaveBeenCalled();
+    // Should call either insert or insertHybrid depending on SPLADE availability
+    expect(mockVectorDb.insert).toHaveBeenCalled();
   });
 
   it('should throw error if no PostgreSQL pool', async () => {

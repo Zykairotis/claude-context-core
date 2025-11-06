@@ -46,6 +46,7 @@ function buildRerankText(document: VectorDocument, maxChars: number): string {
   return `${normalized.slice(0, safeLength)}...`;
 }
 import { getAccessibleDatasets, getOrCreateProject, ALL_PROJECTS_SENTINEL, getAllDatasetIds } from '../utils/project-helpers';
+import { getProjectCollections } from '../utils/collection-helpers';
 import { Pool } from 'pg';
 
 export interface ProjectQueryRequest {
@@ -377,61 +378,91 @@ export async function queryProject(
       }
     };
 
-    const isQdrant = vectorDb.constructor.name === 'QdrantVectorDatabase';
     const aggregatedResults: Map<string, SearchResultWithBreakdown> = new Map();
-
-    const supportsListCollections = typeof (vectorDb as any).listCollections === 'function';
-    const supportsHasCollection = typeof (vectorDb as any).hasCollection === 'function';
-    const defaultCollectionName = context.getCollectionName(request.codebasePath);
-
     let candidateCollections: string[] = [];
 
-    if (isQdrant && supportsListCollections) {
-      const allCollections: string[] = await (vectorDb as any).listCollections();
-      const hybridCollections = allCollections.filter(name => 
-        name.startsWith('hybrid_code_chunks_') || name.startsWith('project_')
-      );
-      candidateCollections = hybridCollections.length > 0 ? hybridCollections : [defaultCollectionName];
-    } else {
-      let useDefault = true;
-
-      if (supportsHasCollection) {
-        try {
-          const collectionExists = await (vectorDb as any).hasCollection(defaultCollectionName);
-          useDefault = collectionExists;
-          if (!collectionExists) {
-            console.warn(`[queryProject] Collection ${defaultCollectionName} not found – falling back to available collections.`);
-          }
-        } catch (error) {
-          useDefault = false;
-          console.warn(`[queryProject] Failed to verify collection ${defaultCollectionName}:`, error);
+    // Phase 5: Project-scoped collection lookup
+    // Try to get collections from dataset_collections table (Island Architecture)
+    try {
+      // Query collections for accessible datasets directly (more efficient than filtering after)
+      if (datasetIds.length > 0) {
+        const placeholders = datasetIds.map((_, i) => `$${i + 1}`).join(', ');
+        const result = await client.query(
+          `SELECT collection_name 
+           FROM claude_context.dataset_collections 
+           WHERE dataset_id IN (${placeholders})`,
+          datasetIds
+        );
+        
+        const accessibleCollections = result.rows.map(row => row.collection_name);
+        
+        if (accessibleCollections.length > 0) {
+          candidateCollections = accessibleCollections;
+          onProgress?.('query', 65, `Searching ${candidateCollections.length} project-scoped collection(s)`);
+          console.log(`[queryProject] ✅ Using project-scoped collections: ${candidateCollections.join(', ')}`);
         }
       }
-
-      if (useDefault) {
-        candidateCollections = [defaultCollectionName];
-      } else if (supportsListCollections) {
-        try {
-          const allCollections: string[] = await (vectorDb as any).listCollections();
-          const filteredCollections = allCollections.filter(name =>
-            name.startsWith('hybrid_code_chunks_') || name.startsWith('code_chunks_') || name.startsWith('project_')
-          );
-          candidateCollections = filteredCollections;
-        } catch (error) {
-          console.warn('[queryProject] Failed to list collections:', error);
-        }
-      }
-
-      if (candidateCollections.length === 0) {
-        candidateCollections = [defaultCollectionName];
+    } catch (error: any) {
+      // If dataset_collections table doesn't exist (42P01) or other error, fall through to legacy logic
+      if (error?.code !== '42P01') {
+        console.warn('[queryProject] Error getting project collections, falling back to legacy discovery:', error);
       }
     }
 
+    // Fallback: Legacy collection discovery (pre-Island Architecture)
+    if (candidateCollections.length === 0) {
+      console.log('[queryProject] ⚠️ Using legacy collection discovery (dataset_collections not available)');
+      
+      const supportsListCollections = typeof (vectorDb as any).listCollections === 'function';
+      const supportsHasCollection = typeof (vectorDb as any).hasCollection === 'function';
+      const defaultCollectionName = context.getCollectionName(request.codebasePath);
+      const isQdrant = vectorDb.constructor.name === 'QdrantVectorDatabase';
+
+      if (isQdrant && supportsListCollections) {
+        const allCollections: string[] = await (vectorDb as any).listCollections();
+        const hybridCollections = allCollections.filter(name => 
+          name.startsWith('hybrid_code_chunks_') || name.startsWith('project_')
+        );
+        candidateCollections = hybridCollections.length > 0 ? hybridCollections : [defaultCollectionName];
+      } else {
+        let useDefault = true;
+
+        if (supportsHasCollection) {
+          try {
+            const collectionExists = await (vectorDb as any).hasCollection(defaultCollectionName);
+            useDefault = collectionExists;
+            if (!collectionExists) {
+              console.warn(`[queryProject] Collection ${defaultCollectionName} not found – falling back to available collections.`);
+            }
+          } catch (error) {
+            useDefault = false;
+            console.warn(`[queryProject] Failed to verify collection ${defaultCollectionName}:`, error);
+          }
+        }
+
+        if (useDefault) {
+          candidateCollections = [defaultCollectionName];
+        } else if (supportsListCollections) {
+          try {
+            const allCollections: string[] = await (vectorDb as any).listCollections();
+            const filteredCollections = allCollections.filter(name =>
+              name.startsWith('hybrid_code_chunks_') || name.startsWith('code_chunks_') || name.startsWith('project_')
+            );
+            candidateCollections = filteredCollections;
+          } catch (error) {
+            console.warn('[queryProject] Failed to list collections:', error);
+          }
+        }
+
+        if (candidateCollections.length === 0) {
+          candidateCollections = [defaultCollectionName];
+        }
+      }
+
+      onProgress?.('query', 65, `Searching ${candidateCollections.length} collection(s) (legacy mode)`);
+    }
+
     candidateCollections = Array.from(new Set(candidateCollections));
-    const progressMessage = candidateCollections.length === 1
-      ? `Searching collection ${candidateCollections[0]}`
-      : `Searching ${candidateCollections.length} collection(s)`;
-    onProgress?.('query', 65, progressMessage);
 
     for (const collectionName of candidateCollections) {
       const results = await executeSearch(collectionName);

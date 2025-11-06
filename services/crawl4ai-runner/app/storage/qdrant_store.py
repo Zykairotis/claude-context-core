@@ -31,7 +31,11 @@ class QdrantVectorStore:
     async def initialize(self) -> None:
         """Initialize Qdrant client."""
         if self.client is None:
-            self.client = AsyncQdrantClient(url=self.url, api_key=self.api_key)
+            # Only pass api_key if it's actually set (avoids warning for local HTTP connections)
+            client_kwargs = {"url": self.url}
+            if self.api_key:
+                client_kwargs["api_key"] = self.api_key
+            self.client = AsyncQdrantClient(**client_kwargs)
             LOGGER.info("QdrantVectorStore initialized at %s", self.url)
 
     async def close(self) -> None:

@@ -132,6 +132,14 @@ postgres_overview() {
   say "$MAGENTA" "Recent GitHub Jobs (last 10)"
   psql_exec -c "SELECT id, repo_org || '/' || repo_name as repository, branch, status, progress, created_at FROM claude_context.github_jobs ORDER BY created_at DESC LIMIT 10;" || true
 
+  echo
+  say "$MAGENTA" "Mesh Nodes Summary"
+  psql_exec -c "SELECT project, type, status, COUNT(*) as count FROM claude_context.mesh_nodes GROUP BY project, type, status ORDER BY project, type;" || true
+
+  echo
+  say "$MAGENTA" "Web Provenance Summary"
+  psql_exec -c "SELECT domain, COUNT(*) as pages, MAX(last_indexed_at) as last_indexed FROM claude_context.web_provenance GROUP BY domain ORDER BY pages DESC LIMIT 10;" || true
+
   if [[ $SHOW_FULL == true ]]; then
     echo
     say "$MAGENTA" "Table Details"

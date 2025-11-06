@@ -180,6 +180,8 @@ services:
       # LLM_API_KEY loaded from env_file (../.env)
       # LLM_API_BASE loaded from env_file (../.env)
       # MODEL_NAME loaded from env_file (../.env)
+    volumes:
+      - /home/mewtwo:/home/mewtwo:ro  # Mount home directory read-only for local indexing
     extra_hosts:
       - "host.docker.internal:host-gateway"  # Map host.docker.internal to host machine (Linux)
     healthcheck:

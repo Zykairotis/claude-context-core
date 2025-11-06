@@ -504,6 +504,58 @@ export class QdrantVectorDatabase implements VectorDatabase {
     }
   }
 
+  async deleteByFilePath(
+    collectionName: string,
+    relativePath: string,
+    projectId?: string,
+    datasetId?: string
+  ): Promise<number | undefined> {
+    try {
+      const filterConditions: any[] = [
+        {
+          key: 'relative_path',
+          match: { value: relativePath }
+        }
+      ];
+
+      // Add optional filters
+      if (projectId) {
+        filterConditions.push({
+          key: 'project_id',
+          match: { value: projectId }
+        });
+      }
+
+      if (datasetId) {
+        filterConditions.push({
+          key: 'dataset_id',
+          match: { value: datasetId }
+        });
+      }
+
+      const response = await this.client.deletePoints(collectionName, {
+        filter: {
+          must: filterConditions
+        }
+      });
+
+      if (response?.status === 'ok') {
+        console.log(`[QdrantVectorDB] 🗑️  Deleted chunks for file ${relativePath} in ${collectionName}`);
+      }
+
+      // Qdrant does not report affected point count for filtered deletions
+      return undefined;
+    } catch (error: any) {
+      if (error?.message?.includes('404')) {
+        console.warn(`[QdrantVectorDB] ⚠️  Collection ${collectionName} not found while deleting ${relativePath}`);
+        return 0;
+      }
+
+      console.error(`[QdrantVectorDB] ❌ Failed to delete file chunks for ${relativePath}:`, error);
+      throw error;
+    }
+  }
+
   async query(
     collectionName: string,
     filter: string,

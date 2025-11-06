@@ -154,6 +154,21 @@ export interface VectorDatabase {
     deleteByDataset(collectionName: string, datasetId: string): Promise<number | undefined>;
 
     /**
+     * Delete documents by file path and optional project/dataset filters
+     * @param collectionName Collection name
+     * @param relativePath Relative file path
+     * @param projectId Optional project UUID for additional filtering
+     * @param datasetId Optional dataset UUID for additional filtering
+     * @returns Number of deleted documents when available
+     */
+    deleteByFilePath(
+        collectionName: string,
+        relativePath: string,
+        projectId?: string,
+        datasetId?: string
+    ): Promise<number | undefined>;
+
+    /**
      * Query documents with filter conditions
      * @param collectionName Collection name
      * @param filter Filter expression

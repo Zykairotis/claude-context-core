@@ -8,6 +8,7 @@ import { PostgresMonitor } from './monitors/postgres-monitor';
 import { CrawlMonitor } from './monitors/crawl-monitor';
 import { QdrantMonitor } from './monitors/qdrant-monitor';
 import { createProjectsRouter } from './routes/projects';
+import { createMeshRouter } from './routes/mesh';
 import { initializeContext } from './core/context-factory';
 import { JobQueue } from './services/job-queue';
 import { GitHubWorker } from './workers/github-worker';
@@ -98,6 +99,9 @@ async function main() {
 
   // Mount project routes (with wsManager for query progress and jobQueue)
   app.use('/projects', createProjectsRouter(pool, crawlMonitor, wsManager, context, jobQueue));
+  
+  // Mount mesh API routes
+  app.use('/api', createMeshRouter(pool));
 
   // Start monitoring and pipe updates to WebSocket
   await postgresMonitor.start((message) => {

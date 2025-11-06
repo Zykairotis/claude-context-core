@@ -5,7 +5,7 @@ import type {
   PipelinePhase,
   QueryResult,
   RetrievalSession,
-  ScopeLevel,
+  UIScopeLevel,
   ScopeResource,
   SmartAnswer,
   SmartQueryMetadata
@@ -26,7 +26,7 @@ export interface GithubIngestForm {
   repo: string;
   branch?: string;
   sha?: string;
-  scope: ScopeLevel;
+  scope: UIScopeLevel;
   includeGlobal?: boolean;
   force?: boolean;
 }
@@ -38,7 +38,7 @@ export interface CrawlIngestForm {
   crawlType: 'single' | 'batch' | 'recursive' | 'sitemap';
   maxPages: number;
   depth: number;
-  scope: ScopeLevel;
+  scope: UIScopeLevel;
   force?: boolean;
 }
 
@@ -46,7 +46,7 @@ export type SmartStrategy = 'multi-query' | 'refinement' | 'concept-extraction';
 
 export interface QueryRequest {
   project: string;
-  scope: ScopeLevel;
+  scope: UIScopeLevel;
   query: string;
   repo?: string;
   pathPrefix?: string;
@@ -84,7 +84,7 @@ export interface WebIngestForm {
 
 export interface ContextClient {
   fetchSnapshot(project: string): Promise<ProjectSnapshot>;
-  listScopeResources(project: string): Promise<Record<ScopeLevel, ScopeResource[]>>;
+  listScopeResources(project: string): Promise<Record<UIScopeLevel, ScopeResource[]>>;
   fetchIngestionJobs(project: string): Promise<IngestionJob[]>;
   triggerGithubIngest(form: GithubIngestForm): Promise<IngestionJob>;
   triggerCrawlIngest(form: CrawlIngestForm): Promise<IngestionJob>;
@@ -154,7 +154,7 @@ export class ContextApiClient implements ContextClient {
     };
   }
 
-  async listScopeResources(project: string): Promise<Record<ScopeLevel, ScopeResource[]>> {
+  async listScopeResources(project: string): Promise<Record<UIScopeLevel, ScopeResource[]>> {
     const response = await this.request<Record<string, ScopeResource[]>>(
       `/projects/${project}/scopes`,
       { method: 'GET' },
@@ -370,7 +370,7 @@ export class ContextApiClient implements ContextClient {
         projectName?: string;
         repo?: string;
         lang?: string;
-        projectScope?: ScopeLevel;
+        projectScope?: UIScopeLevel;
         why?: string;
         chunkTitle?: string;
         symbolName?: string;
@@ -461,7 +461,7 @@ export class ContextApiClient implements ContextClient {
         projectName?: string;
         repo?: string;
         lang?: string;
-        projectScope?: ScopeLevel;
+        projectScope?: UIScopeLevel;
         why?: string;
         chunkTitle?: string;
         symbolName?: string;
@@ -598,7 +598,7 @@ export class MockContextApiClient implements ContextClient {
     };
   }
 
-  async listScopeResources(): Promise<Record<ScopeLevel, ScopeResource[]>> {
+  async listScopeResources(): Promise<Record<UIScopeLevel, ScopeResource[]>> {
     return mockScopes;
   }
 
