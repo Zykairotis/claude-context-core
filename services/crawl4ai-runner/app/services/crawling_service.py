@@ -1071,6 +1071,34 @@ class CrawlingService:
             await postgres_store.create_chunks_collection(collection_name, dimension)
             await qdrant_store.create_collection(collection_name, dimension)
 
+            # ✅ FIX: Create dataset_collections mapping for MCP tools
+            if canonical_dataset_id and metadata_store and metadata_store.pool:
+                try:
+                    # Import the collection helper from TypeScript codebase
+                    # This creates the mapping that MCP tools use to show vector counts
+                    from ..storage.dataset_collection_helper import create_or_update_collection_record
+                    
+                    collection_id = await create_or_update_collection_record(
+                        pool=metadata_store.pool,
+                        dataset_id=str(canonical_dataset_id),
+                        collection_name=collection_name,
+                        vector_db_type='qdrant',
+                        dimension=dimension,
+                        is_hybrid=True  # Crawl uses hybrid search (dense + sparse)
+                    )
+                    LOGGER.info(
+                        "✅ Created dataset_collections mapping: dataset_id=%s, collection=%s, record_id=%s",
+                        canonical_dataset_id, collection_name, collection_id
+                    )
+                except Exception as coll_exc:
+                    LOGGER.error(
+                        "❌ Failed to create dataset_collections mapping: %s", 
+                        coll_exc, exc_info=True
+                    )
+                    LOGGER.warning(
+                        "⚠️  Crawl will continue but MCP tools may show 0 vectors for this dataset"
+                    )
+
             stored_chunks = []
             for chunk, summary, embedding in zip(chunks, summaries, embeddings):
                 if not embedding:
@@ -1141,6 +1169,21 @@ class CrawlingService:
                     collection_name, stored_chunks
                 )
                 LOGGER.info("Qdrant: Stored %d chunks", qdrant_count)
+                
+                # ✅ FIX: Update point count in dataset_collections after Qdrant storage
+                if canonical_dataset_id and metadata_store and metadata_store.pool and qdrant_count > 0:
+                    try:
+                        from ..storage.dataset_collection_helper import update_collection_point_count
+                        await update_collection_point_count(
+                            pool=metadata_store.pool,
+                            collection_name=collection_name,
+                            point_count=qdrant_count
+                        )
+                    except Exception as count_exc:
+                        LOGGER.warning(
+                            "Failed to update point count in dataset_collections: %s", 
+                            count_exc
+                        )
             except Exception as qd_exc:
                 LOGGER.error("Qdrant storage failed: %s", qd_exc, exc_info=True)
 
