@@ -74,6 +74,10 @@ export class RepositoryManager {
     try {
       console.log(`[RepositoryManager] Cloning ${repoUrl} to ${localPath}`);
       
+      // Configure Git to not prompt for credentials (fixes public repo cloning in Docker)
+      await gitWithProgress.addConfig('core.askPass', '');
+      await gitWithProgress.addConfig('credential.helper', '');
+      
       await gitWithProgress.clone(authenticatedUrl, localPath, {
         '--depth': depth,
         '--single-branch': null,
