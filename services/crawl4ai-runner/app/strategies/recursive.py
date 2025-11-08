@@ -151,6 +151,12 @@ async def crawl_recursive_with_progress(
                     
                     # Only process successful results with content
                     if not result.success or not result.markdown:
+                        # Log skip reason
+                        if not result.success:
+                            error_msg = getattr(result, 'error_message', 'Unknown error')
+                            LOGGER.info(f"⏭️  Skipped {result.url[:80]}... (failed: {error_msg[:100]})")
+                        else:
+                            LOGGER.info(f"⏭️  Skipped {result.url[:80]}... (no content)")
                         continue
                     
                     # Extract title
