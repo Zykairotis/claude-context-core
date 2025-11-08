@@ -580,27 +580,67 @@ export function createProjectsRouter(pool: Pool, crawlMonitor: CrawlMonitor, wsM
         client?.release();
       }
 
-      // Forward to Crawl4AI service
-      const crawlResponse = await fetch(`${config.crawl4aiUrl}/crawl`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          urls: [start_url],  // Crawl4AI expects 'urls' array, not 'start_url'
-          project,
-          dataset: datasetName,
-          mode: crawl_type || 'recursive',  // 'mode' instead of 'crawl_type'
-          max_pages: max_pages || 25,
-          max_depth: depth || 2,  // 'max_depth' instead of 'depth'
-          scope: scope || 'project',
-          same_domain_only: true,
-          auto_discovery: false,  // Disable to crawl exact URLs without sitemap redirects
-          extract_code_examples: true
-        })
-      });
-
-      if (!crawlResponse.ok) {
-        const errorText = await crawlResponse.text();
-        throw new Error(`Crawl4AI returned ${crawlResponse.status}: ${errorText}`);
+      // Forward to Crawl4AI service with retry logic
+      let crawlResponse: globalThis.Response | null = null;
+      let lastError: Error | null = null;
+      const maxRetries = 3;
+      
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout
+          
+          crawlResponse = await fetch(`${config.crawl4aiUrl}/crawl`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              urls: [start_url],  // Crawl4AI expects 'urls' array, not 'start_url'
+              project,
+              dataset: datasetName,
+              mode: crawl_type || 'recursive',  // 'mode' instead of 'crawl_type'
+              max_pages: max_pages || 25,
+              max_depth: depth || 2,  // 'max_depth' instead of 'depth'
+              scope: scope || 'project',
+              same_domain_only: true,
+              auto_discovery: false,  // Disable to crawl exact URLs without sitemap redirects
+              extract_code_examples: true
+            }),
+            signal: controller.signal
+          });
+          
+          clearTimeout(timeoutId);
+          
+          if (!crawlResponse.ok) {
+            const errorText = await crawlResponse.text();
+            throw new Error(`Crawl4AI returned ${crawlResponse.status}: ${errorText}`);
+          }
+          
+          // Success - break retry loop
+          break;
+        } catch (error: any) {
+          lastError = error;
+          console.error(`[API] Crawl4AI request attempt ${attempt}/${maxRetries} failed:`, error.message);
+          
+          // Handle specific error types
+          if (error.name === 'AbortError') {
+            console.error('[API] Crawl4AI request timed out after 30 seconds');
+          } else if (error.code === 'ECONNREFUSED') {
+            console.error('[API] Crawl4AI service is not responding - is it running?');
+          } else if (error.code === 'EPIPE' || error.errno === -32) {
+            console.error('[API] Crawl4AI connection broken (EPIPE) - service may have restarted');
+          }
+          
+          // Wait before retry (exponential backoff)
+          if (attempt < maxRetries) {
+            const waitMs = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
+            console.log(`[API] Waiting ${waitMs}ms before retry...`);
+            await new Promise(resolve => setTimeout(resolve, waitMs));
+          }
+        }
+      }
+      
+      if (!crawlResponse) {
+        throw new Error(`Failed to connect to Crawl4AI after ${maxRetries} attempts: ${lastError?.message || 'Unknown error'}`);
       }
 
       const crawlData: any = await crawlResponse.json();
