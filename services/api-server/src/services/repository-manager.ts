@@ -78,15 +78,17 @@ export class RepositoryManager {
       const cloneEnv = {
         ...process.env,
         GIT_ASKPASS: '',
-        GIT_TERMINAL_PROMPT: '0'
+        GIT_TERMINAL_PROMPT: '0',
+        GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: 'credential.helper',
+        GIT_CONFIG_VALUE_0: ''
       };
       
       await gitWithProgress.env(cloneEnv).clone(authenticatedUrl, localPath, {
         '--depth': depth,
         '--single-branch': null,
         '--branch': branch,
-        '--no-tags': null,
-        '-c': 'credential.helper='  // Disable credential helper
+        '--no-tags': null
       });
 
       console.log(`[RepositoryManager] Successfully cloned ${repoUrl}`);
