@@ -1747,18 +1747,19 @@ async function main() {
   // Crawl4AI Service Tools
   mcpServer.registerTool(`${toolNamespace}.crawl`, {
     title: 'Crawl Web Pages',
-    description: 'Trigger crawl4ai service to crawl and index web pages. Modes: single (1 page), batch (multiple URLs), recursive (follow links), sitemap (parse sitemap.xml). Dataset auto-generated from domain (e.g., docs-example-com). Defaults: scope="project", mode="single"',
+    description: 'Trigger crawl4ai service to crawl and index web pages. Modes: single (1 page), batch (multiple URLs), recursive (follow links), sitemap (parse sitemap.xml). Dataset auto-generated from domain (e.g., docs-example-com). Defaults: scope="project", mode="single", maxPages=50',
     inputSchema: {
       url: z.string().url().describe('URL to crawl'),
       project: z.string().optional().describe('Project name for storage isolation'),
       dataset: z.string().optional().describe('Dataset name (default: auto-generated from domain, e.g., "docs-example-com")'),
       scope: z.enum(['global', 'local', 'project']).optional().describe('Knowledge scope - global: shared across projects, local: local only, project: project-scoped (default: "project")'),
       mode: z.enum(['single', 'batch', 'recursive', 'sitemap']).optional().describe('Crawling mode - single: one page, batch: multiple URLs, recursive: follow links, sitemap: parse sitemap.xml (default: "single")'),
+      maxPages: z.number().optional().describe('Maximum number of pages to crawl (default: 50)'),
       maxDepth: z.number().optional().describe('Maximum depth for recursive crawling (default: 1)'),
       autoDiscovery: z.boolean().optional().describe('Auto-discover llms.txt and sitemaps (default: true)'),
       extractCode: z.boolean().optional().describe('Extract code examples (default: true)')
     }
-  }, async ({ url, project, dataset, scope, mode, maxDepth, autoDiscovery, extractCode }) => {
+  }, async ({ url, project, dataset, scope, mode, maxPages, maxDepth, autoDiscovery, extractCode }) => {
     try {
       const fetch = (await import('node-fetch')).default;
       
@@ -1773,6 +1774,7 @@ async function main() {
         dataset: dataset || domainName,  // Default to domain name (e.g., "docs-example-com")
         scope: scope || 'project',  // Default to "project"
         mode: mode || 'single',
+        max_pages: maxPages || 50,
         max_depth: maxDepth || 1,
         auto_discovery: autoDiscovery !== false,
         extract_code_examples: extractCode !== false
@@ -1799,7 +1801,7 @@ async function main() {
         content: [
           {
             type: 'text',
-            text: `✅ Crawl started successfully!\n\n📋 Details:\n  • Progress ID: ${progress_id}\n  • URL: ${url}\n  • Project: ${projectName}\n  • Dataset: ${datasetName}\n  • Scope: ${scopeName}\n  • Mode: ${mode || 'single'}\n\n🔍 Check progress with:\n  claudeContext.crawlStatus("${progress_id}")`
+            text: `✅ Crawl started successfully!\n\n📋 Details:\n  • Progress ID: ${progress_id}\n  • URL: ${url}\n  • Project: ${projectName}\n  • Dataset: ${datasetName}\n  • Scope: ${scopeName}\n  • Mode: ${mode || 'single'}\n  • Max Pages: ${maxPages || 50}\n\n🔍 Check progress with:\n  claudeContext.crawlStatus("${progress_id}")`
           }
         ],
         structuredContent: {
@@ -1809,6 +1811,7 @@ async function main() {
           dataset: datasetName,
           scope: scopeName,
           mode: mode || 'single',
+          maxPages: maxPages || 50,
           status: 'started',
           message: `Use claudeContext.crawlStatus("${progress_id}") to check progress`
         }
