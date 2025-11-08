@@ -9,6 +9,7 @@ import { CrawlMonitor } from './monitors/crawl-monitor';
 import { QdrantMonitor } from './monitors/qdrant-monitor';
 import { createProjectsRouter } from './routes/projects';
 import { createMeshRouter } from './routes/mesh';
+import { createCogneeRouter } from './routes/cognee';
 import { initializeContext } from './core/context-factory';
 import { JobQueue } from './services/job-queue';
 import { GitHubWorker } from './workers/github-worker';
@@ -102,6 +103,47 @@ async function main() {
   
   // Mount mesh API routes
   app.use('/api', createMeshRouter(pool));
+  
+  // Initialize Auto-Watch Manager for real-time file sync
+  // TODO: Enable after fixing TypeScript compilation issues
+  // try {
+  //   const { initializeAutoWatchManager } = await import('../../../dist/sync/auto-watch-manager.js');
+  //   const autoWatchManager = await initializeAutoWatchManager(context, pool, {
+  //     autoRecover: true,
+  //     pollInterval: 30000, // Check every 30 seconds
+  //     onWatchStart: (config: any) => {
+  //       console.log(`[AutoWatch] Started watching: ${config.path} (${config.project}/${config.dataset})`);
+  //       wsManager.broadcast({
+  //         type: 'watch:event' as const,
+  //         data: { event: 'started', config },
+  //         timestamp: new Date().toISOString()
+  //       });
+  //     },
+  //     onWatchStop: (config: any) => {
+  //       console.log(`[AutoWatch] Stopped watching: ${config.path}`);
+  //       wsManager.broadcast({
+  //         type: 'watch:event' as const,
+  //         data: { event: 'stopped', config },
+  //         timestamp: new Date().toISOString()
+  //       });
+  //     },
+  //     onWatchError: (config: any, error: any) => {
+  //       console.error(`[AutoWatch] Error for ${config.path}:`, error.message);
+  //       wsManager.broadcast({
+  //         type: 'watch:error' as const,
+  //         data: { config, error: error.message },
+  //         timestamp: new Date().toISOString()
+  //       });
+  //     }
+  //   });
+  //   console.log('[Server] Auto-Watch Manager initialized - real-time sync enabled');
+  // } catch (error) {
+  //   console.warn('[Server] Auto-Watch Manager not available:', error);
+  // }
+
+  // Mount Cognee API proxy routes
+  app.use('/cognee', createCogneeRouter());
+  console.log('[Server] Cognee API proxy mounted at /cognee');
 
   // Start monitoring and pipe updates to WebSocket
   await postgresMonitor.start((message) => {

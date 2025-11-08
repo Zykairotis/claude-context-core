@@ -13,9 +13,13 @@ POSTGRES_HOST=${POSTGRES_HOST:-localhost}
 POSTGRES_PORT=${POSTGRES_PORT:-5533}
 POSTGRES_USER=${POSTGRES_USER:-postgres}
 POSTGRES_DB=${POSTGRES_DB:-claude_context}
+COGNEE_DB=${COGNEE_DB:-cognee_db}
 POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-code-context-secure-password}
 
 QDRANT_URL=${QDRANT_URL:-http://localhost:6333}
+NEO4J_CONTAINER=${NEO4J_CONTAINER:-claude-context-neo4j}
+NEO4J_USER=${NEO4J_USER:-neo4j}
+NEO4J_PASSWORD=${NEO4J_PASSWORD:-secure-graph-password}
 
 SHOW_FULL=false
 USE_COLOR=true
@@ -117,6 +121,24 @@ postgres_overview() {
   psql_exec -c "\dt+ claude_context.*"
 
   echo
+  say "$MAGENTA" "All Tables with Exact Row Counts"
+  local tables
+  tables=$(psql_sql "SELECT tablename FROM pg_tables WHERE schemaname = 'claude_context' ORDER BY tablename;")
+  
+  if [[ -z "$tables" ]]; then
+    say "$YELLOW" "No tables found in claude_context schema."
+  else
+    printf "%-30s %15s\n" "Table" "Row Count"
+    printf "%s\n" "────────────────────────────────────────────────"
+    while IFS= read -r table; do
+      [[ -z "$table" ]] && continue
+      local count
+      count=$(psql_sql "SELECT COUNT(*) FROM claude_context.\"$table\";" 2>/dev/null || echo "ERROR")
+      printf "%-30s %15s\n" "$table" "$count"
+    done <<< "$tables"
+  fi
+
+  echo
   say "$MAGENTA" "Extensions"
   psql_exec -c '\dx'
 
@@ -142,7 +164,7 @@ postgres_overview() {
 
   if [[ $SHOW_FULL == true ]]; then
     echo
-    say "$MAGENTA" "Table Details"
+    say "$MAGENTA" "Table Details (Schema + Sample Data)"
     local tables
     tables=$(psql_sql "SELECT tablename FROM pg_tables WHERE schemaname = 'claude_context' ORDER BY tablename;")
     if [[ -z "$tables" ]]; then
@@ -151,8 +173,64 @@ postgres_overview() {
       while IFS= read -r table; do
         [[ -z "$table" ]] && continue
         echo
-        say "$GREEN" "▶ claude_context.$table"
+        say "$GREEN" "▶▶▶ claude_context.$table"
+        
+        # Show table schema
+        echo
+        say "$YELLOW" "Schema:"
         psql_exec -c "\d+ claude_context.\"$table\""
+        
+        # Show row count
+        local count
+        count=$(psql_sql "SELECT COUNT(*) FROM claude_context.\"$table\";" 2>/dev/null || echo "0")
+        echo
+        say "$YELLOW" "Total Rows: $count"
+        
+        # Show sample data if table has rows
+        if [[ "$count" -gt 0 ]]; then
+          echo
+          say "$YELLOW" "Sample Data (first 5 rows):"
+          psql_exec -c "SELECT * FROM claude_context.\"$table\" LIMIT 5;"
+        else
+          echo
+          say "$YELLOW" "⚠ Table is empty (no data)"
+        fi
+        
+        echo
+        printf "%s\n" "────────────────────────────────────────────────────────────────"
+      done <<< "$tables"
+    fi
+  fi
+}
+
+cognee_db_overview() {
+  pretty_header "Cognee Database Overview"
+  say "$YELLOW" "Database : $COGNEE_DB"
+  
+  # Check if cognee_db exists
+  local db_exists
+  db_exists=$(docker exec "$POSTGRES_CONTAINER" psql -At -U "$POSTGRES_USER" -c "SELECT 1 FROM pg_database WHERE datname='$COGNEE_DB';" 2>/dev/null || echo "")
+  
+  if [[ "$db_exists" != "1" ]]; then
+    say "$YELLOW" "cognee_db database does not exist."
+    return
+  fi
+  
+  echo
+  say "$MAGENTA" "Tables"
+  docker exec "$POSTGRES_CONTAINER" psql -U "$POSTGRES_USER" -d "$COGNEE_DB" -c "\dt+ public.*" 2>/dev/null || say "$YELLOW" "No tables found."
+  
+  if [[ $SHOW_FULL == true ]]; then
+    echo
+    say "$MAGENTA" "Table Details"
+    local tables
+    tables=$(docker exec "$POSTGRES_CONTAINER" psql -At -U "$POSTGRES_USER" -d "$COGNEE_DB" -c "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename;" 2>/dev/null)
+    if [[ -n "$tables" ]]; then
+      while IFS= read -r table; do
+        [[ -z "$table" ]] && continue
+        echo
+        say "$GREEN" "▶ public.$table"
+        docker exec "$POSTGRES_CONTAINER" psql -U "$POSTGRES_USER" -d "$COGNEE_DB" -c "\d+ public.\"$table\""
       done <<< "$tables"
     fi
   fi
@@ -181,6 +259,30 @@ qdrant_overview() {
   echo "$response" | jq '.result.collections[]? | {name: .name, points_count: (.points_count // 0), vectors_count: (.vectors_count // 0)}'
 }
 
+neo4j_overview() {
+  pretty_header "Neo4j Graph Database Overview"
+  say "$YELLOW" "Container : $NEO4J_CONTAINER"
+  
+  if ! docker ps --filter "name=$NEO4J_CONTAINER" --format '{{.Names}}' | grep -q "$NEO4J_CONTAINER"; then
+    say "$YELLOW" "Neo4j container not running."
+    return
+  fi
+  
+  echo
+  say "$MAGENTA" "Node Count"
+  docker exec "$NEO4J_CONTAINER" cypher-shell -u "$NEO4J_USER" -p "$NEO4J_PASSWORD" "MATCH (n) RETURN count(n) as node_count" 2>/dev/null || say "$YELLOW" "Unable to query Neo4j."
+  
+  echo
+  say "$MAGENTA" "Relationship Count"
+  docker exec "$NEO4J_CONTAINER" cypher-shell -u "$NEO4J_USER" -p "$NEO4J_PASSWORD" "MATCH ()-[r]->() RETURN count(r) as relationship_count" 2>/dev/null || say "$YELLOW" "Unable to query Neo4j."
+  
+  if [[ $SHOW_FULL == true ]]; then
+    echo
+    say "$MAGENTA" "Node Types"
+    docker exec "$NEO4J_CONTAINER" cypher-shell -u "$NEO4J_USER" -p "$NEO4J_PASSWORD" "MATCH (n) RETURN DISTINCT labels(n) as label, count(*) as count ORDER BY count DESC" 2>/dev/null || true
+  fi
+}
+
 main() {
   require_command docker
   require_command curl
@@ -188,7 +290,9 @@ main() {
   ensure_qdrant
 
   postgres_overview
+  cognee_db_overview
   qdrant_overview
+  neo4j_overview
 }
 
 main "$@"

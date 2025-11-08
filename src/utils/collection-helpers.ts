@@ -81,18 +81,26 @@ export async function getOrCreateCollectionRecord(
     try {
         const result = await pool.query(
             `INSERT INTO claude_context.dataset_collections 
-             (dataset_id, collection_name, vector_db_type, dimension, is_hybrid)
-             VALUES ($1, $2, $3, $4, $5)
+             (dataset_id, collection_name, vector_db_type, dimension, is_hybrid, point_count)
+             VALUES ($1, $2, $3, $4, $5, 0)
              ON CONFLICT (dataset_id) DO UPDATE
              SET collection_name = EXCLUDED.collection_name,
+                 vector_db_type = EXCLUDED.vector_db_type,
+                 dimension = EXCLUDED.dimension,
+                 is_hybrid = EXCLUDED.is_hybrid,
                  updated_at = NOW()
-             RETURNING id`,
+             RETURNING id, (xmax = 0) AS inserted`,
             [datasetId, collectionName, vectorDbType, dimension, isHybrid]
         );
         
-        return result.rows[0].id;
+        const record = result.rows[0];
+        const action = record.inserted ? 'Created' : 'Updated';
+        console.log(`[getOrCreateCollectionRecord] ✅ ${action} collection record for dataset ${datasetId} → ${collectionName}`);
+        
+        return record.id;
     } catch (error) {
-        console.error('[getOrCreateCollectionRecord] Error creating collection record:', error);
+        console.error('[getOrCreateCollectionRecord] ❌ Error creating collection record:', error);
+        console.error('[getOrCreateCollectionRecord] Dataset:', datasetId, 'Collection:', collectionName);
         throw error;
     }
 }
@@ -119,15 +127,24 @@ export async function updateCollectionMetadata(
             updates.push(`last_point_count_sync = NOW()`);
         }
         
-        await pool.query(
+        const result = await pool.query(
             `UPDATE claude_context.dataset_collections 
              SET ${updates.join(', ')}
-             WHERE collection_name = $1`,
+             WHERE collection_name = $1
+             RETURNING id, point_count`,
             params
         );
+        
+        if (result.rowCount === 0) {
+            console.warn(`[updateCollectionMetadata] No collection found with name: ${collectionName}`);
+            console.warn('[updateCollectionMetadata] This may indicate the collection record was not created during indexing');
+        } else {
+            console.log(`[updateCollectionMetadata] ✅ Updated collection ${collectionName} with ${pointCount || 0} points`);
+        }
     } catch (error) {
-        console.error('[updateCollectionMetadata] Error updating collection metadata:', error);
-        // Non-fatal - don't throw
+        console.error('[updateCollectionMetadata] ❌ Error updating collection metadata:', error);
+        console.error('[updateCollectionMetadata] Collection:', collectionName, 'PointCount:', pointCount);
+        // Non-fatal - don't throw, but log prominently
     }
 }
 

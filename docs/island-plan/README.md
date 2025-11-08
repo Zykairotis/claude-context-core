@@ -63,8 +63,8 @@ The **Island Architecture** is a comprehensive redesign of how projects, dataset
 5. [PHASE-7-COMPLETE.md](./PHASE-7-COMPLETE.md) - ✅ Integration Testing & Documentation
 
 **📚 Production Documentation:**
-1. [MIGRATION-GUIDE.md](../MIGRATION-GUIDE.md) - Step-by-step upgrade instructions
-2. [DEPLOYMENT-RUNBOOK.md](../DEPLOYMENT-RUNBOOK.md) - Production deployment procedures
+1. [MIGRATION-GUIDE.md](../migration/MIGRATION-GUIDE.md) - Step-by-step upgrade instructions
+2. [DEPLOYMENT-RUNBOOK.md](../deployment/DEPLOYMENT-RUNBOOK.md) - Production deployment procedures
 
 ### 📖 Original Plans (Reference Only)
 
@@ -425,7 +425,7 @@ docs/
 - **Database Schema:** See `services/init-scripts/02-init-schema.sql`
 - **API Endpoints:** See `services/api-server/README.md`
 - **Query Logic:** See `src/api/query.ts`
-- **Incremental Sync:** See `docs/INCREMENTAL-SYNC-SUMMARY.md`
+- **Incremental Sync:** See `docs/incremental-sync/INCREMENTAL-SYNC-SUMMARY.md`
 
 ---
 

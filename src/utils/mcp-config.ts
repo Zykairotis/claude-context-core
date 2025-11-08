@@ -7,6 +7,18 @@ export interface McpDefaults {
   dataset?: string;
 }
 
+export interface McpConfig {
+  currentProject?: string;
+  projects: {
+    [projectName: string]: {
+      project: string;
+      dataset?: string;
+      addedAt: string;
+      lastUsed: string;
+    };
+  };
+}
+
 function resolvePaths() {
   const baseDir = process.env.CLAUDE_CONTEXT_HOME || os.homedir();
   const dir = path.join(baseDir, '.context');
@@ -17,39 +29,97 @@ function resolvePaths() {
 }
 
 /**
- * Load stored MCP defaults (project/dataset). Returns empty object when unset.
+ * Load full MCP config from disk (multiple projects).
  */
-export async function loadMcpDefaults(): Promise<McpDefaults> {
+async function loadMcpConfig(): Promise<McpConfig> {
   try {
     const { file } = resolvePaths();
     const content = await fs.promises.readFile(file, 'utf-8');
-    const parsed = JSON.parse(content) as McpDefaults;
-    return {
-      project: parsed.project?.trim() || undefined,
-      dataset: parsed.dataset?.trim() || undefined
-    };
+    const data = JSON.parse(content.trim());
+    
+    // Handle old format (single project)
+    if (!data.projects && (data.project || data.dataset)) {
+      return {
+        currentProject: data.project,
+        projects: {
+          [data.project]: {
+            project: data.project,
+            dataset: data.dataset,
+            addedAt: new Date().toISOString(),
+            lastUsed: new Date().toISOString()
+          }
+        }
+      };
+    }
+    
+    return data as McpConfig;
   } catch (error: any) {
     if (error?.code === 'ENOENT') {
-      return {};
+      return { projects: {} };
     }
-    console.warn(`[McpConfig] ⚠️  Failed to read defaults: ${error.message ?? error}`);
-    return {};
+    console.warn(`[McpConfig] ⚠️  Failed to load config: ${error.message ?? error}`);
+    return { projects: {} };
   }
 }
 
 /**
- * Persist MCP defaults to disk.
+ * Load MCP defaults from disk (current active project).
+ * Returns undefined for missing file, empty object for invalid JSON.
  */
-export async function saveMcpDefaults(defaults: McpDefaults): Promise<void> {
+export async function loadMcpDefaults(): Promise<McpDefaults> {
+  const config = await loadMcpConfig();
+  
+  if (config.currentProject && config.projects[config.currentProject]) {
+    const proj = config.projects[config.currentProject];
+    return {
+      project: proj.project,
+      dataset: proj.dataset
+    };
+  }
+  
+  return {};
+}
+
+/**
+ * Persist MCP defaults to disk (manages multiple projects).
+ * Returns info about whether project already existed.
+ */
+export async function saveMcpDefaults(defaults: McpDefaults): Promise<{isNew: boolean, previousDataset?: string}> {
   const cleaned: McpDefaults = {
     project: defaults.project?.trim() || undefined,
     dataset: defaults.dataset?.trim() || undefined
   };
+  
+  if (!cleaned.project) {
+    throw new Error('Project name is required');
+  }
 
+  // Load existing config
+  const config = await loadMcpConfig();
+  
+  // Check if project already exists
+  const existingProject = config.projects[cleaned.project];
+  const isNew = !existingProject;
+  const previousDataset = existingProject?.dataset;
+  
+  // Add or update project
+  config.projects[cleaned.project] = {
+    project: cleaned.project,
+    dataset: cleaned.dataset,
+    addedAt: existingProject?.addedAt || new Date().toISOString(),
+    lastUsed: new Date().toISOString()
+  };
+  
+  // Set as current project
+  config.currentProject = cleaned.project;
+
+  // Save updated config
   const { dir, file } = resolvePaths();
   await fs.promises.mkdir(dir, { recursive: true });
-  const content = JSON.stringify(cleaned, null, 2);
+  const content = JSON.stringify(config, null, 2);
   await fs.promises.writeFile(file, content, 'utf-8');
+  
+  return { isNew, previousDataset };
 }
 
 /**
@@ -72,4 +142,53 @@ export async function clearMcpDefaults(): Promise<void> {
  */
 export function getMcpConfigPath(): string {
   return resolvePaths().file;
+}
+
+/**
+ * List all configured projects.
+ */
+export async function listProjects(): Promise<{
+  current?: string;
+  projects: Array<{
+    name: string;
+    dataset?: string;
+    isCurrent: boolean;
+    addedAt: string;
+    lastUsed: string;
+  }>;
+}> {
+  const config = await loadMcpConfig();
+  const projectList = Object.entries(config.projects).map(([name, proj]) => ({
+    name,
+    dataset: proj.dataset,
+    isCurrent: name === config.currentProject,
+    addedAt: proj.addedAt,
+    lastUsed: proj.lastUsed
+  }));
+  
+  return {
+    current: config.currentProject,
+    projects: projectList.sort((a, b) => b.lastUsed.localeCompare(a.lastUsed))
+  };
+}
+
+/**
+ * Switch to a different project.
+ */
+export async function switchProject(projectName: string): Promise<boolean> {
+  const config = await loadMcpConfig();
+  
+  if (!config.projects[projectName]) {
+    return false;
+  }
+  
+  config.currentProject = projectName;
+  config.projects[projectName].lastUsed = new Date().toISOString();
+  
+  const { dir, file } = resolvePaths();
+  await fs.promises.mkdir(dir, { recursive: true });
+  const content = JSON.stringify(config, null, 2);
+  await fs.promises.writeFile(file, content, 'utf-8');
+  
+  return true;
 }

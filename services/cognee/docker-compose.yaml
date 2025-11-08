@@ -10,10 +10,18 @@ services:
     stdin_open: true       # equivalent to -it
     tty: true
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # Access host services (GTE embeddings)
     networks:
-      - embedding-network
+      - claude-context-network
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 1G
 
 networks:
-  embedding-network:
+  claude-context-network:
     external: true
-    name: embedding-network
+    name: claude-context-network

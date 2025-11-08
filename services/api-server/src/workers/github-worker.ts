@@ -1,6 +1,7 @@
 import { Pool } from 'pg';
 import { JobQueue, GitHubJobPayload } from '../services/job-queue';
 import { RepositoryManager } from '../services/repository-manager';
+import { getProgressTracker } from '../services/progress-tracker';
 import PgBoss from 'pg-boss';
 import { loadCore } from '../core/core-loader';
 
@@ -58,17 +59,54 @@ export class GitHubWorker {
     const payload = job.data;
     const jobId = payload.jobId; // Use the github_jobs table ID from payload
 
-    console.log(`[GitHubWorker] Processing job ${jobId} for ${payload.repoOrg}/${payload.repoName}`);
+    console.log(`[GitHubWorker] Processing job:`, payload);
+
+    // Get project and dataset names first
+    const jobInfo = await this.pool.query(
+      `SELECT p.name as project_name, d.name as dataset_name
+       FROM claude_context.github_jobs gj
+       JOIN claude_context.projects p ON gj.project_id = p.id
+       JOIN claude_context.datasets d ON gj.dataset_id = d.id
+       WHERE gj.id = $1`,
+      [jobId]
+    );
+
+    if (jobInfo.rows.length === 0) {
+      throw new Error('Job not found in database');
+    }
+
+    const { project_name, dataset_name } = jobInfo.rows[0];
+
+    // Start tracking progress
+    const progressTracker = getProgressTracker();
+    const operationId = progressTracker.startOperation(
+      'github-ingest',
+      project_name,
+      dataset_name,
+      jobId // Use jobId as the operation ID
+    );
 
     // Update job status to in_progress
-    await this.updateJobStatus(jobId!, 'in_progress', 0, 'Starting repository clone...');
+    await this.updateJobStatus(jobId!, 'in_progress', 0, 'Starting repository clone');
+    progressTracker.updateProgress(operationId, {
+      status: 'in_progress',
+      phase: 'Cloning',
+      progress: 0,
+      message: 'Starting repository clone'
+    });
 
     let localPath: string | null = null;
 
     try {
       // Clone repository
-      await this.updateJobStatus(jobId!, 'in_progress', 10, 'Cloning repository...');
-      
+      await this.updateJobStatus(jobId!, 'in_progress', 10, 'Cloning repository');
+      progressTracker.updateProgress(operationId, {
+        status: 'in_progress',
+        phase: 'Cloning',
+        progress: 10,
+        message: 'Cloning repository from GitHub'
+      });
+
       localPath = await this.repoManager.clone(payload.repoUrl, {
         branch: payload.branch,
         depth: 1,
@@ -84,6 +122,12 @@ export class GitHubWorker {
             percent,
             `Cloning: ${progress.stage} ${progress.progress}%`
           );
+          progressTracker.updateProgress(operationId, {
+            status: 'in_progress',
+            phase: 'Cloning',
+            progress: percent,
+            message: `Cloning: ${progress.stage} ${progress.progress}%`
+          });
         }
       });
 
@@ -91,7 +135,7 @@ export class GitHubWorker {
 
       // Get current SHA
       const currentSha = await this.repoManager.getCurrentSha(localPath);
-      
+
       // Update job with SHA
       await this.pool.query(
         'UPDATE claude_context.github_jobs SET sha = $1 WHERE id = $2',
@@ -100,30 +144,26 @@ export class GitHubWorker {
 
       // Get ingestGithubRepository from core
       await this.updateJobStatus(jobId!, 'in_progress', 45, 'Loading indexing engine...');
-      
+      progressTracker.updateProgress(operationId, {
+        status: 'in_progress',
+        phase: 'Loading',
+        progress: 45,
+        message: 'Loading indexing engine'
+      });
+
       const { ingestGithubRepository } = this.core;
-
-      // Get project and dataset names
-      const jobInfo = await this.pool.query(
-        `SELECT p.name as project_name, d.name as dataset_name
-         FROM claude_context.github_jobs gj
-         JOIN claude_context.projects p ON gj.project_id = p.id
-         JOIN claude_context.datasets d ON gj.dataset_id = d.id
-         WHERE gj.id = $1`,
-        [jobId]
-      );
-
-      if (jobInfo.rows.length === 0) {
-        throw new Error('Job not found in database');
-      }
-
-      const { project_name, dataset_name } = jobInfo.rows[0];
 
       // Create context instance
       const context = await this.createContext();
 
-      // Index repository
-      await this.updateJobStatus(jobId!, 'in_progress', 50, 'Indexing repository...');
+      // Update status: Indexing
+      await this.updateJobStatus(jobId!, 'in_progress', 50, 'Indexing codebase');
+      progressTracker.updateProgress(operationId, {
+        status: 'in_progress',
+        phase: 'Indexing',
+        progress: 50,
+        message: 'Indexing codebase files'
+      });
 
       const result = await ingestGithubRepository(context, {
         project: project_name,
@@ -142,6 +182,12 @@ export class GitHubWorker {
             progress.phase || 'Indexing...',
             progress.current ? `${progress.current}/${progress.total}` : undefined
           );
+          progressTracker.updateProgress(operationId, {
+            status: 'in_progress',
+            phase: progress.phase || 'Indexing...',
+            progress: Math.min(percent, 95),
+            message: progress.current ? `${progress.current}/${progress.total}` : undefined
+          });
         }
       });
 
@@ -157,20 +203,23 @@ export class GitHubWorker {
          WHERE id = $6`,
         ['completed', 100, result.stats?.indexedFiles || 0, result.stats?.totalChunks || 0, 'Completed', jobId]
       );
+      progressTracker.completeOperation(operationId);
 
       console.log(`[GitHubWorker] Job ${jobId} completed successfully`);
     } catch (error: any) {
       console.error(`[GitHubWorker] Job ${jobId} failed:`, error);
 
-      // Update job as failed
-      await this.pool.query(
-        `UPDATE claude_context.github_jobs 
-         SET status = $1, 
-             completed_at = NOW(),
-             error = $2
-         WHERE id = $3`,
-        ['failed', error.message || String(error), jobId]
+      const errorMessage = error.message || 'Unknown error';
+      await this.updateJobStatus(
+        jobId!,
+        'failed',
+        0,
+        'Failed',
+        errorMessage
       );
+      if (progressTracker && operationId) {
+        progressTracker.failOperation(operationId, errorMessage);
+      }
 
       throw error;
     } finally {

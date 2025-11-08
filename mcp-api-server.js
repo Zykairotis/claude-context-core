@@ -275,7 +275,7 @@ async function main() {
 
   mcpServer.registerTool(`${toolNamespace}.indexLocal`, {
     title: 'Index Local Codebase',
-    description: 'Index a local directory containing code into the vector database for semantic search. Scans all supported files, chunks them intelligently, generates embeddings, and stores them. Runs synchronously - returns when complete. Path must be absolute (start with /).',
+    description: 'Index a local directory containing code into the vector database for semantic search. Scans all supported files, chunks them intelligently, generates embeddings, and stores them. Starts indexing asynchronously and returns immediately. Path must be absolute (start with /).',
     inputSchema: {
       path: z.string().describe('Absolute path to local codebase directory (e.g., "/home/user/projects/my-app"). Must start with / - relative paths not allowed.'),
       dataset: z.string().optional().describe('Dataset name (defaults to directory name)'),
@@ -298,7 +298,10 @@ async function main() {
         throw new Error('Path must be an absolute path (starting with /)');
       }
 
-      const response = await apiRequest(`/projects/${projectName}/ingest/local`, {
+      const finalDataset = dataset || path.split('/').pop() || 'local';
+
+      // Start indexing asynchronously (fire and forget)
+      apiRequest(`/projects/${projectName}/ingest/local`, {
         method: 'POST',
         body: JSON.stringify({
           path,
@@ -309,26 +312,36 @@ async function main() {
           scope: scope || 'project',
           force: force || false
         })
+      }).then(response => {
+        if (response.status === 'completed') {
+          const stats = response.stats || {};
+          console.log(`[Index] ✅ Completed: ${projectName}/${finalDataset} - ${stats.totalChunks || 0} chunks`);
+        } else {
+          console.error(`[Index] ❌ Failed: ${projectName}/${finalDataset} - ${response.error || 'Unknown error'}`);
+        }
+      }).catch(error => {
+        console.error(`[Index] ❌ Error: ${projectName}/${finalDataset} - ${error.message}`);
       });
 
-      if (response.status === 'completed') {
-        const stats = response.stats || {};
-        return {
-          content: [{
-            type: 'text',
-            text: `✅ Local codebase indexed successfully!\n\nProject: ${response.project}\nDataset: ${response.dataset}\nPath: ${response.path}\n\nFiles indexed: ${stats.indexedFiles || 0}\nTotal chunks: ${stats.totalChunks || 0}\nDuration: ${((response.durationMs || 0) / 1000).toFixed(2)}s`
-          }],
-          structuredContent: response
-        };
-      }
-
-      throw new Error(response.error || 'Indexing failed');
+      // Return immediately
+      return {
+        content: [{
+          type: 'text',
+          text: `Indexing started for project "${projectName}" in dataset "${finalDataset}"\n\nUse claudeContext.status to check progress.`
+        }],
+        structuredContent: {
+          path,
+          project: projectName,
+          dataset: finalDataset,
+          status: 'started'
+        }
+      };
 
     } catch (error) {
       return {
         content: [{
           type: 'text',
-          text: `Local indexing failed: ${error instanceof Error ? error.message : String(error)}`
+          text: `Failed to start indexing: ${error instanceof Error ? error.message : String(error)}`
         }],
         isError: true
       };

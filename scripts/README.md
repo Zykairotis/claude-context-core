@@ -27,6 +27,32 @@ QDRANT_URL=http://localhost:6333
 
 ---
 
+## `db-force-reinit.sh`
+
+**⚡ Force reinitialization by auto-terminating active connections first.**
+
+```bash
+./scripts/db-force-reinit.sh [--force] [--with-containers]
+```
+
+### What It Does
+1. Automatically terminates ALL active connections to `claude_context` and `cognee_db`
+2. Runs `db-reinit.sh` with your specified options
+3. No more "database is being accessed by other users" errors!
+
+### When to Use
+- When `db-reinit.sh` fails due to active database connections
+- When Cognee service has connections you can't manually close
+- For automated scripts that need guaranteed clean reinit
+
+### Options
+- `--force` - Skip confirmation prompt
+- `--with-containers` - Also recreate Docker containers
+
+**Tip:** Use this instead of `db-reinit.sh` if you frequently get connection errors.
+
+---
+
 ## `db-inspect.sh`
 
 Inspect the current state of both databases.

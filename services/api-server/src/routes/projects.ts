@@ -9,6 +9,7 @@ import { WebSocketManager } from '../websocket';
 import { getCore } from '../core/context-factory';
 import { JobQueue } from '../services/job-queue';
 import { RepositoryManager } from '../services/repository-manager';
+import { getProgressTracker } from '../services/progress-tracker';
 
 const SMART_STRATEGIES: Array<'multi-query' | 'refinement' | 'concept-extraction'> = [
   'multi-query',
@@ -39,6 +40,44 @@ export function createProjectsRouter(pool: Pool, crawlMonitor: CrawlMonitor, wsM
   const router = Router();
   const core = getCore();
   const repoManager = new RepositoryManager();
+  const progressTracker = getProgressTracker();
+
+  // GET /projects/:project/progress - Get operation progress
+  router.get('/:project/progress', async (req: Request, res: Response) => {
+    try {
+      const { project } = req.params;
+      const { operationId, active } = req.query;
+
+      // Get specific operation progress
+      if (operationId && typeof operationId === 'string') {
+        const progress = progressTracker.getProgress(operationId);
+        if (!progress) {
+          return res.status(404).json({ error: 'Operation not found' });
+        }
+        return res.json(progress);
+      }
+
+      // Get active operations only
+      if (active === 'true') {
+        const operations = project.toLowerCase() === 'all'
+          ? progressTracker.getActiveOperations()
+          : progressTracker.getProjectProgress(project).filter(
+              (p: any) => p.status === 'started' || p.status === 'in_progress'
+            );
+        return res.json({ operations });
+      }
+
+      // Get all operations for project
+      const operations = project.toLowerCase() === 'all'
+        ? progressTracker.getAllOperations()
+        : progressTracker.getProjectProgress(project);
+
+      return res.json({ operations });
+    } catch (error: any) {
+      console.error('[API] /projects/:project/progress error:', error);
+      res.status(500).json({ error: error.message });
+    }
+  });
 
   // GET /projects/:project/stats
   router.get('/:project/stats', async (req: Request, res: Response) => {
@@ -830,15 +869,32 @@ export function createProjectsRouter(pool: Pool, crawlMonitor: CrawlMonitor, wsM
           datasetId = datasetResult.rows[0].id;
         }
 
+        // Start tracking progress
+        const operationId = progressTracker.startOperation(
+          'local-ingest',
+          project,
+          datasetName
+        );
+
         // Call core library directly (synchronous operation)
         const startTime = Date.now();
         
         const progressCallback = (phase: string, percentage: number, detail: string) => {
+          // Update progress tracker
+          progressTracker.updateProgress(operationId, {
+            status: percentage >= 100 ? 'completed' : 'in_progress',
+            phase,
+            progress: Math.min(percentage, 100),
+            message: detail
+          });
+
+          // Also broadcast via WebSocket for real-time updates
           wsManager.broadcast({
             type: 'web:ingest:progress',
             project,
             timestamp: new Date().toISOString(),
             data: {
+              operationId,
               dataset: datasetName,
               source: 'local',
               phase,
@@ -862,13 +918,28 @@ export function createProjectsRouter(pool: Pool, crawlMonitor: CrawlMonitor, wsM
         const duration = Date.now() - startTime;
 
         if (result.status === 'failed') {
+          // Mark operation as failed
+          progressTracker.failOperation(
+            operationId,
+            result.error || 'Local ingestion failed',
+            { path: codebasePath, stats: result.stats }
+          );
+
           return res.status(500).json({
             error: result.error || 'Local ingestion failed',
             project,
             dataset: datasetName,
-            path: codebasePath
+            path: codebasePath,
+            operationId
           });
         }
+
+        // Mark operation as completed
+        progressTracker.completeOperation(operationId, {
+          path: codebasePath,
+          stats: result.stats,
+          durationMs: duration
+        });
 
         res.status(200).json({
           status: 'completed',
@@ -878,7 +949,8 @@ export function createProjectsRouter(pool: Pool, crawlMonitor: CrawlMonitor, wsM
           path: codebasePath,
           scope: scope || 'project',
           stats: result.stats,
-          durationMs: duration
+          durationMs: duration,
+          operationId
         });
 
       } finally {
@@ -1046,6 +1118,159 @@ export function createProjectsRouter(pool: Pool, crawlMonitor: CrawlMonitor, wsM
         dataset: req.body?.dataset,
         path: req.body?.path
       });
+    }
+  });
+
+  // GET /projects/:project/status - Get indexing status for a project
+  // GET /projects/:project/datasets/:dataset/status - Get indexing status for a specific dataset
+  router.get('/:project/status', async (req: Request, res: Response) => {
+    try {
+      const { project } = req.params;
+      const { dataset } = req.query;
+      
+      const client = await pool.connect();
+      try {
+        // Get project ID
+        const projectResult = await client.query(
+          'SELECT id, name FROM claude_context.projects WHERE name = $1',
+          [project]
+        );
+
+        if (projectResult.rows.length === 0) {
+          return res.status(404).json({
+            error: 'Project not found',
+            project,
+            status: 'not_found'
+          });
+        }
+
+        const projectId = projectResult.rows[0].id;
+
+        // If dataset specified, get status for that dataset only
+        if (dataset && typeof dataset === 'string') {
+          // Get dataset ID
+          const datasetResult = await client.query(
+            'SELECT id, name, status FROM claude_context.datasets WHERE project_id = $1 AND name = $2',
+            [projectId, dataset]
+          );
+
+          if (datasetResult.rows.length === 0) {
+            return res.status(404).json({
+              error: 'Dataset not found',
+              project,
+              dataset,
+              status: 'not_found'
+            });
+          }
+
+          const datasetId = datasetResult.rows[0].id;
+
+          // Count chunks in PostgreSQL
+          const chunkResult = await client.query(
+            'SELECT COUNT(*) as chunk_count FROM claude_context.chunks WHERE dataset_id = $1',
+            [datasetId]
+          );
+
+          const chunkCount = parseInt(chunkResult.rows[0].chunk_count || 0);
+
+          // Get Qdrant collection stats
+          let qdrantCount = 0;
+          try {
+            const qdrantUrl = process.env.QDRANT_URL || 'http://localhost:6333';
+            const response = await fetch(`${qdrantUrl}/collections`);
+            const data: any = await response.json();
+            
+            // Get first collection (hybrid_code_chunks_*)
+            const collection = data?.result?.collections?.[0];
+            if (collection && collection.name) {
+              const statsResp = await fetch(`${qdrantUrl}/collections/${collection.name}`);
+              const statsData: any = await statsResp.json();
+              qdrantCount = statsData?.result?.points_count || 0;
+            }
+          } catch (err: any) {
+            console.warn('[Status] Could not fetch Qdrant stats:', err.message);
+          }
+
+          // Determine status
+          let status = 'empty';
+          let percentage = 0;
+          
+          if (qdrantCount > 0) {
+            status = 'completed';
+            percentage = 100;
+          } else if (chunkCount > 0) {
+            status = 'indexing';
+            percentage = Math.round((chunkCount / (chunkCount + 100)) * 100); // Estimate
+          }
+
+          return res.status(200).json({
+            project,
+            dataset,
+            status,
+            expected: qdrantCount || chunkCount,
+            stored: qdrantCount || chunkCount,
+            percentage,
+            chunks_in_postgres: chunkCount,
+            vectors_in_qdrant: qdrantCount,
+            timestamp: new Date().toISOString()
+          });
+        }
+
+        // Get status for all datasets in project
+        const datasetsResult = await client.query(
+          'SELECT id, name, status FROM claude_context.datasets WHERE project_id = $1',
+          [projectId]
+        );
+
+        const datasets = await Promise.all(datasetsResult.rows.map(async (ds: any) => {
+          const chunkResult = await client.query(
+            'SELECT COUNT(*) as chunk_count FROM claude_context.chunks WHERE dataset_id = $1',
+            [ds.id]
+          );
+
+          const chunkCount = parseInt(chunkResult.rows[0].chunk_count || 0);
+
+          return {
+            name: ds.name,
+            status: ds.status,
+            chunk_count: chunkCount
+          };
+        }));
+
+        // Get total Qdrant count
+        let totalQdrantCount = 0;
+        try {
+          const qdrantUrl = process.env.QDRANT_URL || 'http://localhost:6333';
+          const response = await fetch(`${qdrantUrl}/collections`);
+          const data: any = await response.json();
+          
+          const collection = data?.result?.collections?.[0];
+          if (collection && collection.name) {
+            const statsResp = await fetch(`${qdrantUrl}/collections/${collection.name}`);
+            const statsData: any = await statsResp.json();
+            totalQdrantCount = statsData?.result?.points_count || 0;
+          }
+        } catch (err: any) {
+          console.warn('[Status] Could not fetch Qdrant stats:', err.message);
+        }
+
+        const totalChunks = datasets.reduce((sum, ds) => sum + ds.chunk_count, 0);
+
+        return res.status(200).json({
+          project,
+          datasets,
+          total_chunks_in_postgres: totalChunks,
+          total_vectors_in_qdrant: totalQdrantCount,
+          dataset_count: datasets.length,
+          timestamp: new Date().toISOString()
+        });
+
+      } finally {
+        client.release();
+      }
+    } catch (error: any) {
+      console.error('[API] /projects/:project/status error:', error);
+      res.status(500).json({ error: error.message });
     }
   });
 
@@ -1572,5 +1797,135 @@ export function createProjectsRouter(pool: Pool, crawlMonitor: CrawlMonitor, wsM
     }
   });
 
+  // POST /projects/:project/autowatch/add - Add auto-watch configuration
+  router.post('/:project/autowatch/add', async (req: Request, res: Response) => {
+    try {
+      const { project } = req.params;
+      const { path: codebasePath, dataset, autoStart = true, debounceMs = 2000 } = req.body;
+
+      if (!codebasePath) {
+        return res.status(400).json({ error: 'path is required' });
+      }
+
+      if (!fs.existsSync(codebasePath)) {
+        return res.status(400).json({ error: `Path does not exist: ${codebasePath}` });
+      }
+
+      // Get auto-watch manager
+      const { getAutoWatchManager } = await import('../../../../dist/sync/auto-watch-manager.js');
+      const manager = getAutoWatchManager();
+      
+      if (!manager) {
+        return res.status(503).json({ error: 'Auto-watch manager not initialized' });
+      }
+
+      const datasetName = dataset || codebasePath.split('/').pop() || 'default';
+      
+      // Add watch configuration
+      const config = await manager.addWatchConfig(
+        codebasePath,
+        project,
+        datasetName,
+        { autoStart, debounceMs }
+      );
+
+      res.json({
+        message: 'Auto-watch configuration added',
+        config,
+        started: config.autoStart
+      });
+
+    } catch (error: any) {
+      console.error('[API] /projects/:project/autowatch/add error:', error);
+      res.status(500).json({ 
+        error: error.message,
+        project: req.params.project
+      });
+    }
+  });
+
+  // DELETE /projects/:project/autowatch/remove - Remove auto-watch configuration
+  router.delete('/:project/autowatch/remove', async (req: Request, res: Response) => {
+    try {
+      const { project } = req.params;
+      const { path: codebasePath, dataset } = req.body;
+
+      if (!codebasePath) {
+        return res.status(400).json({ error: 'path is required' });
+      }
+
+      const { getAutoWatchManager } = await import('../../../../dist/sync/auto-watch-manager.js');
+      const manager = getAutoWatchManager();
+      
+      if (!manager) {
+        return res.status(503).json({ error: 'Auto-watch manager not initialized' });
+      }
+
+      const datasetName = dataset || codebasePath.split('/').pop() || 'default';
+      const removed = await manager.removeWatchConfig(codebasePath, project, datasetName);
+
+      if (removed) {
+        res.json({
+          message: 'Auto-watch configuration removed',
+          path: codebasePath,
+          project,
+          dataset: datasetName
+        });
+      } else {
+        res.status(404).json({
+          error: 'Configuration not found',
+          path: codebasePath,
+          project,
+          dataset: datasetName
+        });
+      }
+
+    } catch (error: any) {
+      console.error('[API] /projects/:project/autowatch/remove error:', error);
+      res.status(500).json({ 
+        error: error.message,
+        project: req.params.project
+      });
+    }
+  });
+
+  // GET /projects/:project/autowatch/list - List auto-watch configurations
+  router.get('/:project/autowatch/list', async (req: Request, res: Response) => {
+    try {
+      const { project } = req.params;
+      
+      const { getAutoWatchManager } = await import('../../../../dist/sync/auto-watch-manager.js');
+      const manager = getAutoWatchManager();
+      
+      if (!manager) {
+        return res.status(503).json({ error: 'Auto-watch manager not initialized' });
+      }
+
+      const allConfigs = manager.getConfigs();
+      const projectConfigs = allConfigs.filter((c: any) => c.project === project);
+      const activeWatchers = manager.getActiveWatchers();
+      const activeKeys = new Set(activeWatchers.map((w: any) => w.id));
+
+      res.json({
+        project,
+        configurations: projectConfigs.map((c: any) => ({
+          ...c,
+          isActive: activeKeys.has(`${c.project}:${c.dataset}:${c.path}`)
+        })),
+        total: projectConfigs.length,
+        active: projectConfigs.filter((c: any) => 
+          activeKeys.has(`${c.project}:${c.dataset}:${c.path}`)
+        ).length
+      });
+
+    } catch (error: any) {
+      console.error('[API] /projects/:project/autowatch/list error:', error);
+      res.status(500).json({ 
+        error: error.message,
+        project: req.params.project
+      });
+    }
+  });
+
   return router;
-}
+};

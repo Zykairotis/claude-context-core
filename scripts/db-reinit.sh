@@ -14,9 +14,13 @@ POSTGRES_HOST=${POSTGRES_HOST:-localhost}
 POSTGRES_PORT=${POSTGRES_PORT:-5533}
 POSTGRES_USER=${POSTGRES_USER:-postgres}
 POSTGRES_DB=${POSTGRES_DB:-claude_context}
+COGNEE_DB=${COGNEE_DB:-cognee_db}
 POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-code-context-secure-password}
 
 QDRANT_URL=${QDRANT_URL:-http://localhost:6333}
+NEO4J_CONTAINER=${NEO4J_CONTAINER:-claude-context-neo4j}
+NEO4J_USER=${NEO4J_USER:-neo4j}
+NEO4J_PASSWORD=${NEO4J_PASSWORD:-secure-graph-password}
 
 FORCE=false
 WITH_CONTAINERS=false
@@ -44,11 +48,17 @@ while [[ $# -gt 0 ]]; do
       cat <<'EOF'
 Usage: scripts/db-reinit.sh [--with-containers] [--force]
 
-Drop and recreate the PostgreSQL claude_context schema and all Qdrant collections.
+Explicitly cleans and drops:
+  • PostgreSQL claude_context schema (CASCADE)
+  • ALL tables in claude_context (dynamically discovered and truncated)
+  • cognee_db database (complete recreation)
+  • All Qdrant collections (vector data)
+  • Neo4j graph database (knowledge graph)
+
 Automatically restarts API server to recreate pg-boss job queue tables.
 
 Options:
-  --with-containers  Stop, recreate, and start docker compose services (postgres, qdrant).
+  --with-containers  Stop, recreate, and start docker compose services (postgres, qdrant, neo4j).
   --db-only          Only touch databases (default).
   --force            Skip confirmation prompts.
 EOF
@@ -124,10 +134,16 @@ confirm_action() {
   fi
 
   echo
-  say "$RED" "⚠️  This will DROP and recreate the PostgreSQL schema and delete all Qdrant collections."
+  say "$RED" "⚠️  This will TRUNCATE ALL TABLES in claude_context schema (dynamically discovered)"
+  say "$RED" "⚠️  Then DROP and recreate the entire PostgreSQL schema (CASCADE)"
+  say "$RED" "⚠️  Delete ALL Qdrant vector collections"
+  say "$RED" "⚠️  Recreate cognee_db database completely"
+  say "$RED" "⚠️  Clean Neo4j graph database (all nodes and relationships)"
   if [[ $WITH_CONTAINERS == true ]]; then
-    say "$RED" "⚠️  Containers postgres and qdrant will be stopped and recreated."
+    say "$RED" "⚠️  Containers postgres, qdrant, and neo4j will be stopped and recreated."
   fi
+  say "$RED" ""
+  say "$RED" "ALL DATA WILL BE PERMANENTLY DELETED!"
   read -r -p "Proceed? (type 'reinit' to continue): " answer
   if [[ "$answer" != "reinit" ]]; then
     echo "Aborted."
@@ -139,15 +155,63 @@ recreate_containers() {
   select_compose_cmd
   pushd "$SERVICES_DIR" >/dev/null
   say "$YELLOW" "Stopping compose services (postgres, qdrant)..."
-  "${DOCKER_COMPOSE_CMD[@]}" stop postgres qdrant >/dev/null 2>&1 || true
-  say "$YELLOW" "Removing containers and volumes..."
-  "${DOCKER_COMPOSE_CMD[@]}" down --volumes >/dev/null
-  say "$YELLOW" "Starting postgres and qdrant..."
-  "${DOCKER_COMPOSE_CMD[@]}" up -d postgres qdrant >/dev/null
+  "${DOCKER_COMPOSE_CMD[@]}" stop postgres qdrant
+  say "$YELLOW" "Rebuilding core library..."
+  pushd "$ROOT_DIR" >/dev/null
+  if ! npm run build 2>&1 | grep -i "error" >&2; then
+    say "$GREEN" "Core library rebuilt successfully"
+  else
+    say "$RED" "Warning: Core library build had errors (continuing anyway)"
+  fi
   popd >/dev/null
+  
+  say "$YELLOW" "Rebuilding API server..."
+  pushd "$SERVICES_DIR/api-server" >/dev/null
+  if ! npm run build 2>&1 | grep -i "error" >&2; then
+    say "$GREEN" "API server rebuilt successfully"
+  else
+    say "$RED" "Warning: API server build had errors (continuing anyway)"
+  fi
+  popd >/dev/null
+
+  say "$YELLOW" "Removing containers and volumes..."
+  "${DOCKER_COMPOSE_CMD[@]}" down --volumes
+  say "$YELLOW" "Starting postgres and qdrant..."
+  "${DOCKER_COMPOSE_CMD[@]}" up -d postgres qdrant
 
   wait_for_health "$POSTGRES_CONTAINER"
   wait_for_health claude-context-qdrant || true
+}
+
+clean_critical_tables() {
+  say "$YELLOW" "Explicitly cleaning ALL tables before schema drop..."
+  
+  # Get list of all tables in claude_context schema (excluding views)
+  local tables
+  tables=$(docker exec "$POSTGRES_CONTAINER" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -t -c \
+    "SELECT tablename FROM pg_tables WHERE schemaname = 'claude_context';" 2>/dev/null | tr -d ' ') || true
+  
+  if [[ -z "$tables" ]]; then
+    say "$YELLOW" "No tables found in claude_context schema."
+    return 0
+  fi
+  
+  local table_count=0
+  while IFS= read -r table; do
+    [[ -z "$table" ]] && continue
+    
+    # Try to truncate, ignore errors
+    if docker exec "$POSTGRES_CONTAINER" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+       -c "TRUNCATE TABLE claude_context.\"$table\" CASCADE;" >/dev/null 2>&1; then
+      say "$GREEN" "  ✓ Truncated: $table"
+      ((table_count++)) || true
+    else
+      say "$YELLOW" "  ⚠ Skipped: $table (may have dependencies or be protected)"
+    fi
+  done <<< "$tables"
+  
+  say "$GREEN" "Cleaned $table_count tables (will be fully removed by schema drop)."
+  return 0
 }
 
 drop_schema() {
@@ -169,6 +233,7 @@ run_init_scripts() {
     "$ROOT_DIR/services/init-scripts/01-init-pgvector.sql"
     "$ROOT_DIR/services/init-scripts/02-init-schema.sql"
     "$ROOT_DIR/services/init-scripts/03-github-jobs.sql"
+    "$ROOT_DIR/services/init-scripts/04-dataset-collections.sql"
   )
 
   for init_script in "${scripts[@]}"; do
@@ -234,6 +299,36 @@ clean_qdrant() {
   done <<< "$collections"
 }
 
+recreate_cognee_db() {
+  say "$YELLOW" "Recreating cognee_db database..."
+  
+  # Drop and recreate cognee_db
+  psql_exec "DROP DATABASE IF EXISTS $COGNEE_DB;"
+  psql_exec "CREATE DATABASE $COGNEE_DB OWNER $POSTGRES_USER;"
+  
+  # Add extensions to cognee_db
+  docker exec "$POSTGRES_CONTAINER" psql -U "$POSTGRES_USER" -d "$COGNEE_DB" -c "CREATE EXTENSION IF NOT EXISTS vector;"
+  docker exec "$POSTGRES_CONTAINER" psql -U "$POSTGRES_USER" -d "$COGNEE_DB" -c "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";"
+  
+  say "$GREEN" "cognee_db database recreated."
+}
+
+clean_neo4j() {
+  say "$YELLOW" "Cleaning Neo4j graph database..."
+  
+  if ! docker ps --filter "name=$NEO4J_CONTAINER" --format '{{.Names}}' | grep -q "$NEO4J_CONTAINER"; then
+    say "$YELLOW" "Neo4j container not running, skipping."
+    return
+  fi
+
+  # Delete all nodes and relationships
+  if docker exec "$NEO4J_CONTAINER" cypher-shell -u "$NEO4J_USER" -p "$NEO4J_PASSWORD" "MATCH (n) DETACH DELETE n" 2>/dev/null; then
+    say "$GREEN" "Neo4j graph data deleted."
+  else
+    say "$YELLOW" "Failed to clean Neo4j (may need manual cleanup)."
+  fi
+}
+
 restart_api_server() {
   local api_container="claude-context-api-server"
   
@@ -290,12 +385,17 @@ main() {
     ensure_postgres
   fi
 
+  # Clean critical tables first before dropping schema
+  clean_critical_tables
+  
   drop_schema
   create_schema_and_extensions
   run_init_scripts
   run_migrations
-
+  
+  recreate_cognee_db
   clean_qdrant
+  clean_neo4j
 
   # Restart API server to recreate pg-boss tables
   restart_api_server || true

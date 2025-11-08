@@ -51,16 +51,26 @@ This project uses SPARC (Specification, Pseudocode, Architecture, Refinement, Co
 
 ## SPARC Commands
 
-### Core Commands
+⚠️ **Installation Required for SPARC Commands**
+
+### Core Commands (requires claude-flow setup)
 - `npx claude-flow sparc modes` - List available modes
 - `npx claude-flow sparc run <mode> "<task>"` - Execute specific mode
 - `npx claude-flow sparc tdd "<feature>"` - Run complete TDD workflow
 - `npx claude-flow sparc info <mode>` - Get mode details
 
-### Batchtools Commands
+### Batchtools Commands (requires claude-flow setup)
 - `npx claude-flow sparc batch <modes> "<task>"` - Parallel execution
 - `npx claude-flow sparc pipeline "<task>"` - Full pipeline processing
 - `npx claude-flow sparc concurrent <mode> "<tasks-file>"` - Multi-task processing
+
+### Alternative: Direct Agent Approach
+```bash
+# Use Claude Code's Task tool directly instead
+Task("Specification", "Analyze requirements...", "specification")
+Task("Architecture", "Design system...", "architecture")
+Task("Refinement", "Implement with TDD...", "refinement")
+```
 
 ### Build Commands
 - `npm run build` - Build project
@@ -140,11 +150,29 @@ This project uses SPARC (Specification, Pseudocode, Architecture, Refinement, Co
 
 ## 🚀 Quick Setup
 
+### Prerequisites
 ```bash
-# Add MCP servers (Claude Flow required, others optional)
+# Verify npx is available (required)
+which npx && npx --version
+
+# For advanced MCP features, register first:
+# Flow-Nexus: https://flow-nexus.ruv.io (required for cloud coordination)
+```
+
+### Basic Setup (Recommended)
+```bash
+# Use Claude Code's Task tool directly (no MCP required)
+# All 54 agent types available via Task tool
+```
+
+### Advanced MCP Setup (Optional)
+```bash
+# Add MCP servers (requires authentication setup)
 claude mcp add claude-flow npx claude-flow@alpha mcp start
 claude mcp add ruv-swarm npx ruv-swarm mcp start  # Optional: Enhanced coordination
 claude mcp add flow-nexus npx flow-nexus@latest mcp start  # Optional: Cloud features
+
+# Note: Flow-Nexus features require platform registration
 ```
 
 ## MCP Tool Categories
@@ -165,9 +193,20 @@ claude mcp add flow-nexus npx flow-nexus@latest mcp start  # Optional: Cloud fea
 `benchmark_run`, `features_detect`, `swarm_monitor`
 
 ### Flow-Nexus MCP Tools (Optional Advanced Features)
-Flow-Nexus extends MCP capabilities with 70+ cloud-based orchestration tools:
+⚠️ **Authentication Required for Flow-Nexus Features**
 
-**Key MCP Tool Categories:**
+Flow-Nexus extends MCP capabilities with 70+ cloud-based orchestration tools, but requires platform registration:
+
+**Setup Required:**
+```bash
+# Register account first
+npx flow-nexus@latest register  # or visit https://flow-nexus.ruv.io
+
+# Login to access cloud features
+mcp__flow-nexus__user_login
+```
+
+**Available Cloud Features (after authentication):**
 - **Swarm & Agents**: `swarm_init`, `swarm_scale`, `agent_spawn`, `task_orchestrate`
 - **Sandboxes**: `sandbox_create`, `sandbox_execute`, `sandbox_upload` (cloud execution)
 - **Templates**: `template_list`, `template_deploy` (pre-built project templates)
@@ -176,10 +215,7 @@ Flow-Nexus extends MCP capabilities with 70+ cloud-based orchestration tools:
 - **Real-time**: `execution_stream_subscribe`, `realtime_subscribe` (live monitoring)
 - **Storage**: `storage_upload`, `storage_list` (cloud file management)
 
-**Authentication Required:**
-- Register: `mcp__flow-nexus__user_register` or `npx flow-nexus@latest register`
-- Login: `mcp__flow-nexus__user_login` or `npx flow-nexus@latest login`
-- Access 70+ specialized MCP tools for advanced orchestration
+**Alternative**: Use Claude Code's Task tool directly for agent spawning without authentication requirements.
 
 ## 🚀 Agent Execution Flow with Claude Code
 

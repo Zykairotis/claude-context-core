@@ -47,13 +47,14 @@ function buildRerankText(document: VectorDocument, maxChars: number): string {
 }
 import { getAccessibleDatasets, getOrCreateProject, ALL_PROJECTS_SENTINEL, getAllDatasetIds } from '../utils/project-helpers';
 import { getProjectCollections } from '../utils/collection-helpers';
+import { DatasetParser } from '../utils/dataset-parser.js';
 import { Pool } from 'pg';
 
 export interface ProjectQueryRequest {
   project: string;
   query: string;
   codebasePath: string;
-  dataset?: string;
+  dataset?: string | string[];  // Support single dataset, array, "*", or glob patterns
   includeGlobal?: boolean;
   topK?: number;
   threshold?: number;
@@ -200,24 +201,43 @@ export async function queryProject(
 
       datasetIds = accessibleDatasetIds;
 
-      // Narrow to explicit dataset when provided
+      // Narrow to explicit dataset(s) when provided
       if (request.dataset) {
-        const datasetResult = await client.query(
-          'SELECT id FROM claude_context.datasets WHERE project_id = $1 AND name = $2',
-          [project.id, request.dataset]
+        // Get all available dataset names for this project
+        const allDatasetsResult = await client.query(
+          'SELECT id, name FROM claude_context.datasets WHERE project_id = $1',
+          [project.id]
         );
-
-        if (datasetResult.rows.length === 0) {
+        
+        const availableDatasets = allDatasetsResult.rows.map(row => row.name);
+        const datasetIdMap = new Map(
+          allDatasetsResult.rows.map(row => [row.name, row.id])
+        );
+        
+        // Parse dataset input using DatasetParser
+        // Handles: single string, array, "*" wildcard, and glob patterns
+        const requestedDatasetNames = DatasetParser.parse(
+          request.dataset,
+          availableDatasets
+        );
+        
+        if (requestedDatasetNames.length === 0) {
           return { requestId, results: [], metadata: makeEmptyMetadata() };
         }
-
-        const datasetId = datasetResult.rows[0].id;
-
-        if (!accessibleDatasetIds.includes(datasetId)) {
+        
+        // Convert dataset names to IDs
+        const requestedDatasetIds = requestedDatasetNames
+          .map(name => datasetIdMap.get(name))
+          .filter((id): id is string => id !== undefined);
+        
+        // Filter to only accessible datasets
+        datasetIds = accessibleDatasetIds.filter(id => 
+          requestedDatasetIds.includes(id)
+        );
+        
+        if (datasetIds.length === 0) {
           return { requestId, results: [], metadata: makeEmptyMetadata() };
         }
-
-        datasetIds = [datasetId];
       }
     }
 
@@ -302,6 +322,42 @@ export async function queryProject(
 
     const searchStart = performance.now();
 
+    // Build Qdrant filter expression from filter object
+    const buildQdrantFilter = (filter: Record<string, any>): string | undefined => {
+      const conditions: string[] = [];
+      
+      // Handle datasetIds array
+      if (filter.datasetIds && filter.datasetIds.length > 0) {
+        const datasetConditions = filter.datasetIds
+          .map((id: string) => `metadata.datasetId == "${id}"`)
+          .join(' OR ');
+        conditions.push(`(${datasetConditions})`);
+      }
+      
+      // Handle projectId
+      if (filter.projectId) {
+        conditions.push(`metadata.projectId == "${filter.projectId}"`);
+      }
+      
+      // Handle other filters
+      if (filter.repo) {
+        conditions.push(`metadata.repo == "${filter.repo}"`);
+      }
+      
+      if (filter.lang) {
+        conditions.push(`metadata.lang == "${filter.lang}"`);
+      }
+      
+      if (filter.pathPrefix) {
+        conditions.push(`metadata.path LIKE "${filter.pathPrefix}%"`);
+      }
+      
+      return conditions.length > 0 ? conditions.join(' AND ') : undefined;
+    };
+
+    const qdrantFilter = buildQdrantFilter(filter);
+    console.log('[queryProject] Using filter:', qdrantFilter);
+
     const executeSearch = async (collectionName: string): Promise<SearchResultWithBreakdown[]> => {
       try {
         // Dual-model search path
@@ -311,7 +367,7 @@ export async function queryProject(
             request.query,
             initialK,
             threshold,
-            undefined, // filter managed internally
+            qdrantFilter, // FIX: Pass the filter
             hybridEnabled,
             querySparse
           );
@@ -329,12 +385,12 @@ export async function queryProject(
             (vectorDb as any).hybridQuery(collectionName, queryVector.vector, querySparse, {
               topK: initialK,
               threshold,
-              filter
+              filterExpr: qdrantFilter // FIX: Use filterExpr with Qdrant format
             }),
             vectorDb.search(collectionName, queryVector.vector, {
               topK: initialK,
               threshold,
-              filter
+              filterExpr: qdrantFilter // FIX: Use filterExpr with Qdrant format
             })
           ]);
 
@@ -364,7 +420,7 @@ export async function queryProject(
         const denseOnlyResults = await vectorDb.search(collectionName, queryVector.vector, {
           topK: initialK,
           threshold,
-          filter
+          filterExpr: qdrantFilter // FIX: Use filterExpr with Qdrant format
         });
 
         return denseOnlyResults.map(result => ({
@@ -420,10 +476,33 @@ export async function queryProject(
 
       if (isQdrant && supportsListCollections) {
         const allCollections: string[] = await (vectorDb as any).listCollections();
-        const hybridCollections = allCollections.filter(name => 
-          name.startsWith('hybrid_code_chunks_') || name.startsWith('project_')
-        );
-        candidateCollections = hybridCollections.length > 0 ? hybridCollections : [defaultCollectionName];
+        
+        // If querying a specific project, prioritize project-specific collections
+        if (!isAllProjects && project) {
+          // Generate possible collection names for this project
+          // Format: project_<project_name_lowercase_with_underscores>
+          const projectCollectionPattern = `project_${project.name.toLowerCase().replace(/[^a-z0-9]+/g, '_')}`;
+          
+          // Find collections that match this project
+          const projectCollections = allCollections.filter(name => 
+            name.startsWith(projectCollectionPattern)
+          );
+          
+          if (projectCollections.length > 0) {
+            candidateCollections = projectCollections;
+            console.log(`[queryProject] ✅ Found ${projectCollections.length} project-specific collection(s) for ${project.name}: ${projectCollections.join(', ')}`);
+          } else {
+            console.log(`[queryProject] ⚠️ No project-specific collection found for ${project.name} (looking for ${projectCollectionPattern}*)`);
+          }
+        }
+        
+        // Fall back to all hybrid/project collections if no project-specific ones found
+        if (candidateCollections.length === 0) {
+          const hybridCollections = allCollections.filter(name => 
+            name.startsWith('hybrid_code_chunks_') || name.startsWith('project_')
+          );
+          candidateCollections = hybridCollections.length > 0 ? hybridCollections : [defaultCollectionName];
+        }
       } else {
         let useDefault = true;
 
@@ -852,3 +931,10 @@ export async function queryWebContent(
     client.release();
   }
 }
+
+// Export multi-dataset query functions
+export { 
+  queryMultipleDatasets, 
+  queryDatasetsByPattern,
+  getMultiDatasetStats 
+} from './query-multi-dataset';

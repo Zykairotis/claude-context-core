@@ -135,7 +135,7 @@ Management Tools:
 
 ### 3. Comprehensive Documentation
 
-**File:** `docs/MCP-ISLAND-ARCHITECTURE.md` (650+ lines)
+**File:** `docs/mcp/MCP-ISLAND-ARCHITECTURE.md` (650+ lines)
 
 **Contents:**
 - ✅ Overview of changes
@@ -158,7 +158,7 @@ Management Tools:
 |------|---------------|------|
 | `mcp-server.js` | ~200 | Tool updates + instructions |
 | `mcp-api-server.js` | ~30 | Instructions enhancement |
-| `docs/MCP-ISLAND-ARCHITECTURE.md` | 650+ | New documentation |
+| `docs/mcp/MCP-ISLAND-ARCHITECTURE.md` | 650+ | New documentation |
 | **Total** | **~880** | **Complete MCP update** |
 
 ### Tools Updated
@@ -429,9 +429,9 @@ await claudeContext.index({path: "/path"})
 
 ## 📚 Documentation Links
 
-- **Main Guide:** `docs/MCP-ISLAND-ARCHITECTURE.md`
+- **Main Guide:** `docs/mcp/MCP-ISLAND-ARCHITECTURE.md`
 - **Architecture:** `docs/island-plan/README.md`
-- **Migration:** `docs/MIGRATION-GUIDE.md`
+- **Migration:** `docs/migration/MIGRATION-GUIDE.md`
 - **Phase 7:** `docs/island-plan/PHASE-7-COMPLETE.md`
 
 ---

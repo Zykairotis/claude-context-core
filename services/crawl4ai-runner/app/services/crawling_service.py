@@ -271,12 +271,17 @@ class CrawlingService:
         base_urls: Sequence[str],
         discovered: Optional[DiscoveredFile],
     ) -> List[str]:
+        # If sitemap mode is explicitly requested, always parse as sitemap
+        if ctx.mode == CrawlMode.SITEMAP:
+            urls: List[str] = []
+            # Use discovered sitemap if available, otherwise use base_urls as sitemaps
+            sitemap_urls = [discovered.url] if discovered and is_sitemap(discovered.url) else base_urls
+            for sitemap_url in sitemap_urls:
+                urls.extend(await parse_sitemap(sitemap_url))
+            return urls or list(base_urls)
+        
+        # Auto-discovery handling (when mode != SITEMAP)
         if not discovered:
-            if ctx.mode == CrawlMode.SITEMAP:
-                urls: List[str] = []
-                for sitemap_url in base_urls:
-                    urls.extend(await parse_sitemap(sitemap_url))
-                return urls or list(base_urls)
             return list(base_urls)
 
         if is_llms_variant(discovered.url):

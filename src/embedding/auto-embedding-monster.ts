@@ -81,9 +81,9 @@ export class AutoEmbeddingMonster extends Embedding {
   constructor(config: AutoEmbeddingMonsterConfig) {
     super();
 
-    // Set concurrency and batch size
-    this.concurrency = config.concurrency || 16;
-    this.batchSizePerRequest = Math.min(config.batchSizePerRequest || 32, 32); // Cap at 32 (CodeRank max)
+    // Set concurrency and batch size - BALANCED FOR PERFORMANCE
+    this.concurrency = config.concurrency || 8; // 8 parallel workers
+    this.batchSizePerRequest = Math.min(config.batchSizePerRequest || 22, 22); // Batch size of 22
     
     // GTE has 8192 token limit - can use full batch size (32 texts)
     // CodeRank can use larger batches (32 texts per request)

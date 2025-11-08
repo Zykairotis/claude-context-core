@@ -57,7 +57,7 @@ Complete the Island Architecture implementation with comprehensive integration t
 
 ### 2. Migration Guide
 
-**File:** `docs/MIGRATION-GUIDE.md` (650 lines)
+**File:** `docs/migration/MIGRATION-GUIDE.md` (650 lines)
 
 **Contents:**
 
@@ -109,7 +109,7 @@ Complete the Island Architecture implementation with comprehensive integration t
 
 ### 3. Deployment Runbook
 
-**File:** `docs/DEPLOYMENT-RUNBOOK.md` (550 lines)
+**File:** `docs/deployment/DEPLOYMENT-RUNBOOK.md` (550 lines)
 
 **Contents:**
 
@@ -408,7 +408,7 @@ it('should isolate data between projects', async () => {
 
 2. **Review Migration Guide** (if upgrading)
    ```bash
-   cat docs/MIGRATION-GUIDE.md
+   cat docs/migration/MIGRATION-GUIDE.md
    ```
 
 3. **Run Integration Tests**
@@ -418,7 +418,7 @@ it('should isolate data between projects', async () => {
 
 4. **Deploy Using Runbook**
    ```bash
-   cat docs/DEPLOYMENT-RUNBOOK.md
+   cat docs/deployment/DEPLOYMENT-RUNBOOK.md
    ```
 
 ### For Developers
@@ -471,8 +471,8 @@ it('should isolate data between projects', async () => {
 
 ### Documentation
 - **Architecture:** `docs/island-plan/README.md`
-- **Migration:** `docs/MIGRATION-GUIDE.md`
-- **Deployment:** `docs/DEPLOYMENT-RUNBOOK.md`
+- **Migration:** `docs/migration/MIGRATION-GUIDE.md`
+- **Deployment:** `docs/deployment/DEPLOYMENT-RUNBOOK.md`
 - **Phase Reports:** `docs/island-plan/PHASE-*-COMPLETE.md`
 
 ### Getting Help

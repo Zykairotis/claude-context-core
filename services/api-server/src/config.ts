@@ -13,6 +13,8 @@ export const config = {
   qdrantUrl: process.env.QDRANT_URL || 'http://localhost:6333',
   crawl4aiUrl: rawCrawl4aiUrl,
   crawl4aiBaseUrl,
+  cogneeUrl: process.env.COGNEE_API_URL || 'http://localhost:8340',
+  cogneeApiKey: process.env.COGNEE_API_KEY || 'local-development-only',
   nodeEnv: process.env.NODE_ENV || 'development',
   
   // Polling intervals (ms)

@@ -822,7 +822,7 @@ describe('AutoScoping', () => {
 
 (Content to be created showing examples, benefits, and how to use)
 
-### File: `docs/MCP-ISLAND-ARCHITECTURE.md`
+### File: `docs/mcp/MCP-ISLAND-ARCHITECTURE.md`
 
 **Update existing docs to mention auto-scoping**
 

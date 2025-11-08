@@ -8,6 +8,7 @@
  */
 
 const path = require('path');
+const fs = require('fs');
 const { z } = require('zod');
 const { Pool } = require('pg');
 
@@ -44,6 +45,126 @@ const {
 const { AutoScoping } = require('./dist/utils/auto-scoping');
 const { AutoScopeConfig } = require('./dist/utils/mcp-auto-config');
 
+// ============================================================================
+// FILE LOGGING SETUP
+// ============================================================================
+const LOG_FILE = path.join(__dirname, 'logs', 'mcp-server.log');
+const DEBUG_LOG_FILE = path.join(__dirname, 'logs', 'mcp-debug.log');
+
+// Ensure logs directory exists
+const logsDir = path.dirname(LOG_FILE);
+if (!fs.existsSync(logsDir)) {
+  fs.mkdirSync(logsDir, { recursive: true });
+}
+
+// Create write streams for log files
+const logStream = fs.createWriteStream(LOG_FILE, { flags: 'a' });
+const debugStream = fs.createWriteStream(DEBUG_LOG_FILE, { flags: 'a' });
+
+// Enhanced logging function
+function log(level, ...args) {
+  const timestamp = new Date().toISOString();
+  const message = args.map(arg => 
+    typeof arg === 'object' ? JSON.stringify(arg, null, 2) : String(arg)
+  ).join(' ');
+  
+  const logLine = `[${timestamp}] [${level}] ${message}\n`;
+  
+  // Write to console (for backward compatibility)
+  console[level === 'ERROR' ? 'error' : 'log'](...args);
+  
+  // Write to main log file
+  logStream.write(logLine);
+  
+  // Write debug logs to separate file
+  if (level === 'DEBUG' || level === 'ERROR') {
+    debugStream.write(logLine);
+  }
+}
+
+// Override console methods to use file logging
+const originalConsoleLog = console.log;
+const originalConsoleError = console.error;
+const originalConsoleWarn = console.warn;
+
+console.log = (...args) => {
+  const timestamp = new Date().toISOString();
+  const message = args.map(arg => 
+    typeof arg === 'object' ? JSON.stringify(arg, null, 2) : String(arg)
+  ).join(' ');
+  logStream.write(`[${timestamp}] [INFO] ${message}\n`);
+  originalConsoleLog(...args);
+};
+
+console.error = (...args) => {
+  const timestamp = new Date().toISOString();
+  const message = args.map(arg => 
+    typeof arg === 'object' ? JSON.stringify(arg, null, 2) : String(arg)
+  ).join(' ');
+  logStream.write(`[${timestamp}] [ERROR] ${message}\n`);
+  debugStream.write(`[${timestamp}] [ERROR] ${message}\n`);
+  originalConsoleError(...args);
+};
+
+console.warn = (...args) => {
+  const timestamp = new Date().toISOString();
+  const message = args.map(arg => 
+    typeof arg === 'object' ? JSON.stringify(arg, null, 2) : String(arg)
+  ).join(' ');
+  logStream.write(`[${timestamp}] [WARN] ${message}\n`);
+  originalConsoleWarn(...args);
+};
+
+// Log startup
+console.log('='.repeat(80));
+console.log('MCP SERVER STARTING');
+console.log(`Log files: ${LOG_FILE}`);
+console.log(`Debug logs: ${DEBUG_LOG_FILE}`);
+console.log('='.repeat(80));
+
+// Auto-start TypeScript compiler in watch mode for development
+let watchProcess = null;
+if (process.env.NODE_ENV !== 'production' && process.env.DISABLE_AUTO_WATCH !== 'true') {
+  const { spawn } = require('child_process');
+  const fs = require('fs');
+  
+  // Check if we're in development (tsconfig.json exists)
+  const tsconfigPath = path.join(__dirname, 'tsconfig.json');
+  if (fs.existsSync(tsconfigPath)) {
+    console.error('[MCP] 🔧 Starting TypeScript watch mode for auto-compilation...');
+    
+    watchProcess = spawn('npx', ['tsc', '--watch', '--preserveWatchOutput'], {
+      cwd: __dirname,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: false
+    });
+    
+    // Log compilation status
+    watchProcess.stdout.on('data', (data) => {
+      const output = data.toString();
+      if (output.includes('Found 0 errors') || output.includes('Watching for file changes')) {
+        console.error('[MCP] ✅ TypeScript compilation successful');
+      }
+    });
+    
+    watchProcess.stderr.on('data', (data) => {
+      const output = data.toString();
+      if (output.includes('error TS')) {
+        console.error('[MCP] ⚠️  TypeScript compilation error:', output.split('\n')[0]);
+      }
+    });
+    
+    // Cleanup on exit
+    process.on('exit', () => {
+      if (watchProcess) {
+        watchProcess.kill();
+      }
+    });
+    
+    console.error('[MCP] 📝 TypeScript watch mode active - changes will auto-compile');
+  }
+}
+
 function toInt(value, defaultValue) {
   if (value === undefined || value === null || value === '') {
     return defaultValue;
@@ -58,6 +179,66 @@ function toFloat(value, defaultValue) {
   }
   const parsed = Number.parseFloat(value);
   return Number.isFinite(parsed) ? parsed : defaultValue;
+}
+
+// API Server Configuration for GitHub ingestion
+const API_BASE_URL = process.env.API_SERVER_URL || 'http://localhost:3030';
+
+/**
+ * Make HTTP request to API server for GitHub ingestion
+ */
+async function apiRequest(endpoint, options = {}) {
+  const fetch = (await import('node-fetch')).default;
+  const url = `${API_BASE_URL}${endpoint}`;
+  
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...options.headers
+    }
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    let errorMessage;
+    try {
+      const errorJson = JSON.parse(errorText);
+      errorMessage = errorJson.error || errorJson.message || response.statusText;
+    } catch {
+      errorMessage = errorText || response.statusText;
+    }
+    throw new Error(`API Error (${response.status}): ${errorMessage}`);
+  }
+
+  return response.json();
+}
+
+/**
+ * Poll for GitHub job completion
+ */
+async function pollJobCompletion(jobId, project, maxAttempts = 120) {
+  let attempts = 0;
+  
+  while (attempts < maxAttempts) {
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
+    const history = await apiRequest(`/projects/${project}/ingest/history`);
+    const job = history.find(j => j.id === jobId);
+    
+    if (job) {
+      if (job.status === 'completed' || job.status === 'ok') {
+        return { status: 'completed', job };
+      }
+      if (job.status === 'failed') {
+        throw new Error(`Job failed: ${job.summary || 'Unknown error'}`);
+      }
+    }
+    
+    attempts++;
+  }
+  
+  return { status: 'timeout', message: 'Job still running after 2 minutes' };
 }
 
 function createEmbedding() {
@@ -198,27 +379,32 @@ async function main() {
   const context = new Context({ embedding, vectorDatabase, postgresPool });
   let mcpDefaults = await loadMcpDefaults();
 
+  // In-memory indexing progress tracker (no database needed)
+  const indexingProgress = new Map(); // key: "project/dataset", value: { expected, stored, status, startTime }
+
   const instructions = 'Real-time MCP server wrapping the local claude-context-core build with Island Architecture support.\n\n' +
     '🏝️ ISLAND ARCHITECTURE:\n' +
     'All indexing and search now uses project/dataset scoping for proper isolation and 5-10x faster queries.\n' +
     'Set defaults once with claudeContext.init, then omit project/dataset in future calls.\n\n' +
+    '🧠 COGNEE KNOWLEDGE GRAPH TOOLS:\n' +
+    '  • cognee.add - Add files/URLs to datasets\n' +
+    '  • cognee.cognify - Transform datasets into knowledge graphs\n' +
+    '  • cognee.search - Search with 12 strategies (CHUNKS, INSIGHTS, RAG_COMPLETION, etc.)\n' +
+    '  • cognee.datasets - Manage datasets (list, create, delete, share)\n' +
+    '  • cognee.codePipeline - Index and retrieve code repositories\n\n' +
     'Core Tools:\n' +
     '  • claudeContext.init - Set default project/dataset\n' +
-    '  • claudeContext.defaults - Show current defaults\n' +
-    '  • claudeContext.index - Index codebase (project-aware)\n' +
+    '  • claudeContext.index - Index codebase (auto-checks if already indexed)\n' +
     '  • claudeContext.search - Semantic search (DEFAULT - use this for all searches)\n' +
-    '  • claudeContext.status - Check index status\n' +
-    '  • claudeContext.clear - Delete collections\n' +
-    '  • claudeContext.ingestCrawl - Ingest crawl4ai pages\n\n' +
+    '  • claudeContext.status - Check index status & operation progress (with showOperations: true)\n' +
+    '  • claudeContext.listDatasets - List all datasets in a project\n' +
+    '  • claudeContext.ingestCrawl - Ingest crawl4ai pages\n' +
+    '  • claudeContext.indexGitHub - Index GitHub repositories\n\n' +
     'Web Crawling Tools: claudeContext.crawl, claudeContext.crawlStatus, claudeContext.cancelCrawl\n' +
-    'Chunk Retrieval Tools: claudeContext.searchChunks, claudeContext.getChunk, claudeContext.listScopes\n\n' +
+    'Scope Tools: claudeContext.listScopes\n\n' +
     '🔍 SEARCH GUIDANCE:\n' +
     '  • Use claudeContext.search for ALL code searches (fast, hybrid search with reranking)\n' +
-    '  • Only use claudeContext.smartQuery when user explicitly asks for:\n' +
-    '    - "Explain how X works"\n' +
-    '    - "Summarize the codebase"\n' +
-    '    - Questions requiring LLM-generated answers with reasoning\n\n' +
-    '⚠️  Legacy path-based tools (claudeContext.reindex) are deprecated.\n' +
+    '  • Use cognee.search for knowledge graph queries with advanced strategies\n\n' +
     'Set environment variables (embedding + database + PostgreSQL) before launching.';
 
   const mcpServer = new McpServer({
@@ -227,6 +413,11 @@ async function main() {
   }, {
     instructions
   });
+
+  // Phase 00-01: Register Cognee MCP Tools
+  const { registerCogneeToolsRefined } = require('./cognee-mcp-tools-refined');
+  registerCogneeToolsRefined(mcpServer, z);
+  console.log('✅ Registered 5 Cognee MCP tools with project/dataset support');
 
   const toolNamespace = 'claudeContext';
 
@@ -244,13 +435,18 @@ async function main() {
       let finalDataset = dataset?.trim();
       let autoDetected = false;
 
-      // Auto-detect if path provided but no project
-      if (detectionPath && !project) {
+      // Auto-detect if path provided (always prefer auto-detection over manual project)
+      if (detectionPath) {
         const autoScope = await AutoScoping.autoDetectScope(detectionPath, 'local');
         finalProject = autoScope.projectId;
         finalDataset = finalDataset || autoScope.datasetName;
         autoDetected = true;
         console.log(`[Auto-Scope] Detected: ${finalProject} / ${finalDataset}`);
+        
+        // Warn if user provided manual project that differs from auto-detected
+        if (project && project !== finalProject) {
+          console.warn(`[Auto-Scope] ⚠️  Ignoring manual project "${project}" in favor of auto-detected "${finalProject}"`);
+        }
       }
 
       if (!finalProject) {
@@ -270,7 +466,7 @@ async function main() {
           await getOrCreateDataset(client, projectRecord.id, finalDataset);
         }
 
-        await saveMcpDefaults({ project: finalProject, dataset: finalDataset });
+        const saveResult = await saveMcpDefaults({ project: finalProject, dataset: finalDataset });
         mcpDefaults = { project: finalProject, dataset: finalDataset };
         
         // Save to auto-scope history if auto-detected
@@ -278,9 +474,19 @@ async function main() {
           await AutoScopeConfig.addToHistory(detectionPath, finalProject);
         }
 
-        const message = autoDetected 
-          ? `Auto-detected and saved defaults!\nProject: ${finalProject}\nDataset: ${finalDataset ?? 'not set'}\nStored at: ${getMcpConfigPath()}\n\nAuto-detection based on path: ${detectionPath}`
-          : `Defaults updated.\nProject: ${finalProject}\nDataset: ${finalDataset ?? 'not set'}\nStored at: ${getMcpConfigPath()}`;
+        let message = '';
+        if (!saveResult.isNew) {
+          // Project already existed
+          message = `Project already configured! Updated settings.\n\nProject: ${finalProject}\nPrevious Dataset: ${saveResult.previousDataset || 'not set'}\nNew Dataset: ${finalDataset ?? 'not set'}\nStored at: ${getMcpConfigPath()}`;
+          if (autoDetected) {
+            message += `\n\nAuto-detection based on path: ${detectionPath}`;
+          }
+        } else {
+          // New project
+          message = autoDetected 
+            ? `Auto-detected and saved NEW project!\nProject: ${finalProject}\nDataset: ${finalDataset ?? 'not set'}\nStored at: ${getMcpConfigPath()}\n\nAuto-detection based on path: ${detectionPath}`
+            : `NEW project configured.\nProject: ${finalProject}\nDataset: ${finalDataset ?? 'not set'}\nStored at: ${getMcpConfigPath()}`;
+        }
         
         return {
           content: [{
@@ -290,7 +496,9 @@ async function main() {
           structuredContent: {
             defaults: mcpDefaults,
             configPath: getMcpConfigPath(),
-            autoDetected
+            autoDetected,
+            isNew: saveResult.isNew,
+            previousDataset: saveResult.previousDataset
           }
         };
       } finally {
@@ -307,30 +515,6 @@ async function main() {
     }
   });
 
-  mcpServer.registerTool(`${toolNamespace}.defaults`, {
-    title: 'Show Default Project',
-    description: 'Display the stored default project/dataset used for commands when omitted',
-    inputSchema: {}
-  }, async () => {
-    const project = mcpDefaults.project ?? null;
-    const dataset = mcpDefaults.dataset ?? null;
-    const summary = [
-      `Project: ${project ?? 'not set'}`,
-      `Dataset: ${dataset ?? 'not set'}`,
-      `Config Path: ${getMcpConfigPath()}`
-    ].join('\n');
-
-    return {
-      content: [{
-        type: 'text',
-        text: summary
-      }],
-      structuredContent: {
-        defaults: mcpDefaults,
-        configPath: getMcpConfigPath()
-      }
-    };
-  });
 
   mcpServer.registerTool(`${toolNamespace}.autoScope`, {
     title: 'Preview Auto-Scoping',
@@ -472,177 +656,279 @@ async function main() {
       force: z.boolean().optional().describe('Re-create the collection even if it already exists')
     }
   }, async ({ path: codebasePath, project, dataset, repo, branch, sha, force }, extra) => {
-    const start = Date.now();
     try {
+      // CRITICAL FIX: Always ensure we have a project name
+      // Priority: 1) explicit project param, 2) mcp defaults, 3) auto-detect from path
       let projectName = project || mcpDefaults.project;
-      let datasetName = dataset || (projectName ? mcpDefaults.dataset : undefined);
-      let autoDetected = false;
       
-      // Auto-detect if no project specified
-      if (!projectName && (await AutoScopeConfig.isEnabled())) {
-        const autoScope = await AutoScoping.autoDetectScope(codebasePath, 'local');
-        projectName = autoScope.projectId;
-        datasetName = datasetName || autoScope.datasetName;
-        autoDetected = true;
-        
-        // Auto-save defaults if enabled
-        if (await AutoScopeConfig.load().then(c => c.autoSave)) {
-          await AutoScopeConfig.saveAutoScope(autoScope);
-          mcpDefaults = await loadMcpDefaults();
-        }
-        
-        console.log(`[Auto-Scope] Using: ${projectName} / ${datasetName}`);
+      // If still no project name, auto-detect from path (Island Architecture requirement)
+      if (!projectName) {
+        const { autoScopeConfig } = await import('./dist/utils/auto-scoping.js');
+        const autoScoped = autoScopeConfig(codebasePath, 'local');
+        projectName = autoScoped.project;
+        console.log(`[Index] Auto-detected project from path: ${projectName}`);
       }
-
-      if (projectName) {
-        const ingestResult = await ingestGithubRepository(context, {
-          project: projectName,
-          dataset: datasetName,
-          repo: repo || datasetName || path.basename(codebasePath),
-          codebasePath,
-          branch,
-          sha,
-          forceReindex: force === true,
-          onProgress: progress => {
-            mcpServer.sendLoggingMessage({
-              level: 'info',
-              logger: 'claude-context:index',
-              data: {
+      
+      const datasetName = dataset || mcpDefaults.dataset || 'local';
+      const finalDataset = datasetName || repo || 'local';
+      const progressKey = `${projectName}/${finalDataset}`;
+      
+      console.log(`[Index] 🏝️ Island Architecture: project="${projectName}", dataset="${finalDataset}"`);
+      
+      // Initialize progress tracking immediately
+      indexingProgress.set(progressKey, {
+        expected: 0,
+        stored: 0,
+        status: 'starting',
+        startTime: Date.now()
+      });
+      
+      // Check if already indexed (only if not forcing)
+      if (!force && projectName && codebasePath) {
+        try {
+          const pool = context.getPostgresPool();
+          if (pool) {
+            const { checkIndexStatus } = await import('./dist/api/check-index-status.js');
+            const indexCheck = await checkIndexStatus(pool, codebasePath, projectName, finalDataset, false);
+            
+            if (indexCheck.isFullyIndexed) {
+              // Already fully indexed
+              indexingProgress.set(progressKey, {
+                expected: indexCheck.stats.indexedFiles,
+                stored: indexCheck.stats.indexedFiles,
+                status: 'completed',
+                startTime: Date.now(),
+                endTime: Date.now()
+              });
+              
+              return {
+                content: [{
+                  type: 'text',
+                  text: `✅ Codebase is already fully indexed!\n\nProject: ${projectName}\nDataset: ${finalDataset}\nFiles: ${indexCheck.stats.totalFiles}\n\nNo changes detected. Use force: true to reindex anyway.`
+                }],
+                structuredContent: {
+                  path: codebasePath,
+                  project: projectName,
+                  dataset: finalDataset,
+                  status: 'already-indexed',
+                  stats: indexCheck.stats
+                }
+              };
+            } else if (indexCheck.isIndexed && indexCheck.recommendation === 'incremental') {
+              // Partially indexed - show what needs updating
+              console.log(`[Index] Codebase partially indexed: ${indexCheck.stats.percentIndexed}% up-to-date`);
+            }
+          }
+        } catch (err) {
+          // Ignore check errors, proceed with indexing
+          console.log(`[Index] Could not check existing index: ${err.message}`);
+        }
+      }
+      
+      // Check if API server is available - try different URLs
+      const API_SERVER_URL = process.env.API_SERVER_URL || 'http://localhost:3030';
+      const useApiServer = process.env.USE_API_SERVER !== 'false';
+      
+      if (projectName && useApiServer) {
+        // Try to use API endpoint first
+        const fetch = (await import('node-fetch')).default;
+        
+        // Fire and forget - don't await!
+        fetch(`${API_SERVER_URL}/projects/${projectName}/ingest/local`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            path: codebasePath,
+            dataset: finalDataset,
+            repo: repo || finalDataset,
+            branch,
+            sha,
+            scope: 'project',
+            force: force || false
+          }),
+          timeout: 5000 // Add timeout to prevent hanging
+        }).then(response => response.json()).then(result => {
+          // Update progress on completion (silent)
+          console.log(`[Index] API response for ${progressKey}:`, result);
+          if (result.status === 'completed') {
+            const chunks = result.stats?.totalChunks || 0;
+            indexingProgress.set(progressKey, {
+              expected: chunks,
+              stored: chunks,
+              status: 'completed',
+              startTime: indexingProgress.get(progressKey)?.startTime || Date.now(),
+              endTime: Date.now()
+            });
+          } else if (result.status === 'failed') {
+            indexingProgress.set(progressKey, {
+              expected: 0,
+              stored: 0,
+              status: 'failed',
+              error: result.error,
+              startTime: indexingProgress.get(progressKey)?.startTime || Date.now(),
+              endTime: Date.now()
+            });
+          }
+        }).catch(error => {
+          // If API server fails, fall back to direct indexing
+          console.warn(`[Index] API server not available (${error.message}), using direct indexing`);
+          
+          // Fall back to direct indexing with setImmediate
+          setImmediate(async () => {
+            try {
+              const result = await ingestGithubRepository(context, {
                 project: projectName,
-                dataset: datasetName || repo || path.basename(codebasePath),
-                path: codebasePath,
-                phase: progress.phase,
-                current: progress.current,
-                total: progress.total,
-                percentage: progress.percentage
+                dataset: finalDataset,
+                repo: repo || finalDataset,
+                codebasePath,
+                branch,
+                sha,
+                forceReindex: force === true,
+                onProgress: (progress) => {
+                  const current = indexingProgress.get(progressKey);
+                  if (current) {
+                    indexingProgress.set(progressKey, {
+                      ...current,
+                      expected: progress.total || current.expected,
+                      stored: progress.current || current.stored,
+                      status: 'indexing',
+                      phase: progress.phase
+                    });
+                  }
+                }
+              });
+              
+              if (result.status === 'completed') {
+                const chunks = result.stats?.totalChunks || 0;
+                indexingProgress.set(progressKey, {
+                  expected: chunks,
+                  stored: chunks,
+                  status: 'completed',
+                  startTime: indexingProgress.get(progressKey)?.startTime || Date.now(),
+                  endTime: Date.now()
+                });
+              } else {
+                indexingProgress.set(progressKey, {
+                  expected: 0,
+                  stored: 0,
+                  status: 'failed',
+                  error: result.error,
+                  startTime: indexingProgress.get(progressKey)?.startTime || Date.now(),
+                  endTime: Date.now()
+                });
               }
-            }, extra.sessionId);
+            } catch (err) {
+              indexingProgress.set(progressKey, {
+                expected: 0,
+                stored: 0,
+                status: 'error',
+                error: err.message,
+                startTime: indexingProgress.get(progressKey)?.startTime || Date.now(),
+                endTime: Date.now()
+              });
+            }
+          });
+        });
+      } else if (projectName && !useApiServer) {
+        // Direct indexing mode (when API server is disabled)
+        setImmediate(async () => {
+          try {
+            const result = await ingestGithubRepository(context, {
+              project: projectName,
+              dataset: finalDataset,
+              repo: repo || finalDataset,
+              codebasePath,
+              branch,
+              sha,
+              forceReindex: force === true,
+              onProgress: (progress) => {
+                const current = indexingProgress.get(progressKey);
+                if (current) {
+                  indexingProgress.set(progressKey, {
+                    ...current,
+                    expected: progress.total || current.expected,
+                    stored: progress.current || current.stored,
+                    status: 'indexing',
+                    phase: progress.phase
+                  });
+                }
+              }
+            });
+            
+            if (result.status === 'completed') {
+              const chunks = result.stats?.totalChunks || 0;
+              indexingProgress.set(progressKey, {
+                expected: chunks,
+                stored: chunks,
+                status: 'completed',
+                startTime: indexingProgress.get(progressKey)?.startTime || Date.now(),
+                endTime: Date.now()
+              });
+            } else {
+              indexingProgress.set(progressKey, {
+                expected: 0,
+                stored: 0,
+                status: 'failed',
+                error: result.error,
+                startTime: indexingProgress.get(progressKey)?.startTime || Date.now(),
+                endTime: Date.now()
+              });
+            }
+          } catch (err) {
+            indexingProgress.set(progressKey, {
+              expected: 0,
+              stored: 0,
+              status: 'error',
+              error: err.message,
+              startTime: indexingProgress.get(progressKey)?.startTime || Date.now(),
+              endTime: Date.now()
+            });
           }
         });
-
-        if (ingestResult.status === 'failed') {
-          throw new Error(ingestResult.error || 'Project ingest failed');
-        }
-
-        const duration = Date.now() - start;
-        const stats = ingestResult.stats;
-        const message = autoDetected
-          ? `✅ Auto-Scoped Index Complete!\n\n` +
-            `Project: ${projectName} (auto-detected)\n` +
-            `Dataset: ${datasetName || repo || path.basename(codebasePath)}\n` +
-            `Duration: ${(duration / 1000).toFixed(2)}s\n` +
-            `Files indexed: ${stats?.indexedFiles ?? 0}\n` +
-            `Chunks: ${stats?.totalChunks ?? 0}\n` +
-            `Status: ${stats?.status ?? 'completed'}`
-          : `Project ${projectName} indexed in ${(duration / 1000).toFixed(2)}s\n` +
-            `Dataset: ${datasetName || repo || path.basename(codebasePath)}\n` +
-            `Files indexed: ${stats?.indexedFiles ?? 0}\n` +
-            `Chunks: ${stats?.totalChunks ?? 0}\n` +
-            `Status: ${stats?.status ?? 'completed'}`;
+      } else {
+        // This should never happen - projectName should always be set by auto-detection
+        console.error('[Index] ❌ CRITICAL: No projectName provided! This causes legacy MD5 collection names.');
+        console.error('[Index] ❌ Dataset collections table will NOT be populated!');
+        console.error('[Index] ❌ Project:', projectName, 'Dataset:', finalDataset);
         
         return {
           content: [{
             type: 'text',
-            text: message
+            text: `❌ Internal Error: No project name detected. This is a bug in the MCP server.\n\n` +
+                  `Project: ${projectName}\n` +
+                  `Dataset: ${finalDataset}\n\n` +
+                  `Please report this error with the above details.`
           }],
-          structuredContent: {
-            path: codebasePath,
-            project: projectName,
-            dataset: datasetName || repo || path.basename(codebasePath),
-            durationMs: duration,
-            stats
-          }
+          isError: true
         };
       }
 
-      const stats = await context.indexCodebase(codebasePath, progress => {
-        mcpServer.sendLoggingMessage({
-          level: 'info',
-          logger: 'claude-context:index',
-          data: {
-            path: codebasePath,
-            phase: progress.phase,
-            current: progress.current,
-            total: progress.total,
-            percentage: progress.percentage
-          }
-        }, extra.sessionId);
-      }, force === true);
-
-      const duration = Date.now() - start;
+      // Return IMMEDIATELY - before any async work starts
       return {
         content: [{
           type: 'text',
-          text: formatIndexStats(codebasePath, stats, duration)
+          text: projectName 
+            ? `Indexing started for project "${projectName}" in dataset "${finalDataset}"\n\nUse claudeContext.status to check progress.`
+            : `Indexing started for "${codebasePath}"\n\nUse claudeContext.status to check progress.`
         }],
         structuredContent: {
           path: codebasePath,
-          durationMs: duration,
-          ...stats
+          project: projectName,
+          dataset: finalDataset,
+          status: 'started'
         }
       };
     } catch (error) {
       return {
         content: [{
           type: 'text',
-          text: `Indexing failed: ${error instanceof Error ? error.message : String(error)}`
+          text: `Failed to start indexing: ${error instanceof Error ? error.message : String(error)}`
         }],
         isError: true
       };
     }
   });
 
-  mcpServer.registerTool(`${toolNamespace}.reindex`, {
-    title: 'Re-index Changed Files (Legacy)',
-    description: '⚠️ DEPRECATED: Legacy incremental reindexing. For Island Architecture, use claudeContext.index with project/dataset and force=false for sync.',
-    inputSchema: {
-      path: z.string().describe('Absolute path to the project or repository root'),
-      project: z.string().optional().describe('Project name (for Island Architecture sync)'),
-      dataset: z.string().optional().describe('Dataset name')
-    }
-  }, async ({ path, project, dataset }) => {
-    try {
-      const projectName = project || mcpDefaults.project;
-      
-      if (projectName) {
-        return {
-          content: [{
-            type: 'text',
-            text: `⚠️  Island Architecture Detected\n\nFor incremental sync with Island Architecture, use:\n  claudeContext.index with:\n    - path: ${path}\n    - project: ${projectName}\n    - dataset: ${dataset || mcpDefaults.dataset || 'your-dataset'}\n    - force: false\n\nThis will automatically detect and sync only changed files.`
-          }],
-          structuredContent: {
-            deprecated: true,
-            useInstead: 'claudeContext.index',
-            project: projectName,
-            path
-          }
-        };
-      }
-      
-      // Legacy mode
-      console.warn('[MCP] Legacy reindexByChange is deprecated');
-      const changes = await context.reindexByChange(path);
-      return {
-        content: [{
-          type: 'text',
-          text: `⚠️  Legacy reindex completed\n\nAdded: ${changes.added}\nModified: ${changes.modified}\nRemoved: ${changes.removed}\n\nNote: Consider migrating to Island Architecture for better project isolation.`
-        }],
-        structuredContent: {
-          path,
-          legacy: true,
-          ...changes
-        }
-      };
-    } catch (error) {
-      return {
-        content: [{
-          type: 'text',
-          text: `Reindex failed: ${error instanceof Error ? error.message : String(error)}`
-        }],
-        isError: true
-      };
-    }
-  });
 
   mcpServer.registerTool(`${toolNamespace}.search`, {
     title: 'Semantic Search',
@@ -651,7 +937,7 @@ async function main() {
       path: z.string().describe('Absolute path to the indexed project'),
       query: z.string().describe('Natural language search query'),
       project: z.string().min(1).optional().describe('Project name for project-aware retrieval'),
-      dataset: z.string().optional().describe('Limit search to a specific dataset'),
+      dataset: z.union([z.string(), z.array(z.string())]).optional().describe('Dataset(s) to search: single name, array, "*" for all, or glob patterns like "github-*"'),
       includeGlobal: z.boolean().optional().describe('Include global datasets (default true)'),
       topK: z.number().int().min(1).max(50).optional().describe('Maximum number of matches to return'),
       threshold: z.number().min(0).max(1).optional().describe('Similarity threshold (0-1)'),
@@ -743,152 +1029,707 @@ async function main() {
     }
   });
 
-  mcpServer.registerTool(`${toolNamespace}.status`, {
-    title: 'Index Status',
-    description: 'Check index status for a project/dataset or legacy path. With Island Architecture, checks project-scoped collections.',
+  mcpServer.registerTool(`${toolNamespace}.checkIndex`, {
+    title: 'Check If Already Indexed',
+    description: 'Check if a codebase is already indexed by comparing SHA-256 hashes. Shows what files are new, modified, or unchanged.',
     inputSchema: {
-      path: z.string().optional().describe('Absolute path (legacy mode)'),
-      project: z.string().optional().describe('Project name for Island Architecture status'),
-      dataset: z.string().optional().describe('Dataset name (optional, shows all datasets if omitted)')
+      path: z.string().describe('Absolute path to the codebase to check'),
+      project: z.string().optional().describe('Project name'),
+      dataset: z.string().optional().describe('Dataset name'),
+      details: z.boolean().optional().describe('Include file lists in response (default: false)')
     }
-  }, async ({ path, project, dataset }) => {
+  }, async ({ path: codebasePath, project, dataset, details }) => {
     try {
-      const vectorDatabase = context.getVectorDatabase();
-      const poolInstance = context.getPostgresPool();
-      const supportsStats = typeof vectorDatabase.getCollectionStats === 'function';
-      
       const projectName = project || mcpDefaults.project;
+      const datasetName = dataset || mcpDefaults.dataset || 'local';
       
-      // Island Architecture mode (project-based)
-      if (projectName && poolInstance) {
-        const client = await poolInstance.connect();
-        try {
-          const datasetName = dataset || mcpDefaults.dataset;
-          
-          // Get all collections for this project (and dataset if specified)
-          let query, params;
-          if (datasetName) {
-            query = `
-              SELECT dc.collection_name, dc.point_count, dc.last_indexed_at, d.name as dataset_name
-              FROM claude_context.dataset_collections dc
-              JOIN claude_context.datasets d ON dc.dataset_id = d.id
-              JOIN claude_context.projects p ON d.project_id = p.id
-              WHERE p.name = $1 AND d.name = $2
-              ORDER BY dc.last_indexed_at DESC
-            `;
-            params = [projectName, datasetName];
-          } else {
-            query = `
-              SELECT dc.collection_name, dc.point_count, dc.last_indexed_at, d.name as dataset_name
-              FROM claude_context.dataset_collections dc
-              JOIN claude_context.datasets d ON dc.dataset_id = d.id
-              JOIN claude_context.projects p ON d.project_id = p.id
-              WHERE p.name = $1
-              ORDER BY d.name, dc.last_indexed_at DESC
-            `;
-            params = [projectName];
-          }
-          
-          const result = await client.query(query, params);
-          
-          if (result.rows.length === 0) {
-            return {
-              content: [{
-                type: 'text',
-                text: datasetName 
-                  ? `No index found for project "${projectName}" / dataset "${datasetName}"`
-                  : `No indices found for project "${projectName}"`
-              }],
-              structuredContent: {
-                project: projectName,
-                dataset: datasetName,
-                collections: []
-              }
-            };
-          }
-          
-          const collections = [];
-          let totalChunks = 0;
-          
-          for (const row of result.rows) {
-            const exists = await vectorDatabase.hasCollection(row.collection_name);
-            if (exists) {
-              collections.push({
-                name: row.collection_name,
-                dataset: row.dataset_name,
-                entityCount: row.point_count || 0,
-                lastIndexed: row.last_indexed_at
-              });
-              totalChunks += (row.point_count || 0);
-            }
-          }
-          
-          const collectionLines = collections.map(col => 
-            `• ${col.dataset}: ${col.name} (${col.entityCount.toLocaleString()} chunks, last indexed: ${new Date(col.lastIndexed).toLocaleString()})`
-          );
-          
-          const summary = [
-            `📊 Index Status for Project "${projectName}"${datasetName ? ` / Dataset "${datasetName}"` : ''}`,
-            '',
-            `Total Collections: ${collections.length}`,
-            `Total Chunks: ${totalChunks.toLocaleString()}`,
-            '',
-            'Collections:',
-            ...collectionLines
-          ].join('\n');
-          
-          return {
-            content: [{ type: 'text', text: summary }],
-            structuredContent: {
-              project: projectName,
-              dataset: datasetName,
-              totalCollections: collections.length,
-              totalChunks,
-              collections
-            }
-          };
-        } finally {
-          client.release();
-        }
-      }
-      
-      // Legacy mode (path-based) - deprecated
-      if (path) {
-        console.warn('[MCP] Legacy path-based status check is deprecated. Use project/dataset instead.');
-        const collectionName = context.getCollectionName(path);
-        const hasIndex = await vectorDatabase.hasCollection(collectionName);
-        
-        if (!hasIndex) {
-          return {
-            content: [{
-              type: 'text',
-              text: `⚠️  No legacy index found for ${path}\n\nNote: Path-based indexing is deprecated. Use Island Architecture with project/dataset instead.`
-            }],
-            structuredContent: { path, hasIndex: false, legacy: true }
-          };
-        }
-        
-        let entityCount = null;
-        if (supportsStats) {
-          const stats = await vectorDatabase.getCollectionStats(collectionName);
-          entityCount = stats?.entityCount ?? null;
-        }
-        
+      if (!projectName) {
         return {
           content: [{
             type: 'text',
-            text: `⚠️  Legacy index exists for ${path}\n• ${collectionName}: ${entityCount ? `${entityCount.toLocaleString()} chunks` : 'stats unavailable'}\n\nNote: Path-based indexing is deprecated. Migrate to Island Architecture with project/dataset.`
+            text: 'Project name required. Use claudeContext.init to set defaults or provide project parameter.'
+          }],
+          isError: true
+        };
+      }
+      
+      // Get PostgreSQL pool
+      const pool = context.getPostgresPool();
+      if (!pool) {
+        return {
+          content: [{
+            type: 'text',
+            text: 'PostgreSQL connection not available. Cannot check index status.'
+          }],
+          isError: true
+        };
+      }
+      
+      // Dynamic import of check function
+      const { checkIndexStatus } = await import('./dist/api/check-index-status.js');
+      
+      // Check the index status
+      const result = await checkIndexStatus(
+        pool,
+        codebasePath,
+        projectName,
+        datasetName,
+        details === true
+      );
+      
+      // Format the response
+      let response = `📊 Index Status for "${codebasePath}"\n`;
+      response += `Project: ${projectName} | Dataset: ${datasetName}\n\n`;
+      
+      if (!result.isIndexed) {
+        response += `❌ Not Indexed - This codebase has never been indexed.\n`;
+        response += `\nRecommendation: Run full indexing.\n`;
+      } else if (result.isFullyIndexed) {
+        response += `✅ Fully Indexed - All files are up-to-date!\n`;
+        response += `\n📈 Statistics:\n`;
+        response += `• Total Files: ${result.stats.totalFiles}\n`;
+        response += `• Indexed Files: ${result.stats.indexedFiles}\n`;
+        response += `• Status: 100% complete, no changes detected\n`;
+      } else {
+        response += `⚠️  Partially Indexed - ${result.stats.percentIndexed}% up-to-date\n`;
+        response += `\n📈 Statistics:\n`;
+        response += `• Total Files: ${result.stats.totalFiles}\n`;
+        response += `• Unchanged: ${result.stats.unchangedFiles} files\n`;
+        response += `• New: ${result.stats.newFiles} files\n`;
+        response += `• Modified: ${result.stats.modifiedFiles} files\n`;
+        response += `• Deleted: ${result.stats.deletedFiles} files\n`;
+        response += `\n💡 Recommendation: ${result.recommendation}\n`;
+      }
+      
+      response += `\n${result.message}\n`;
+      
+      // Add file details if requested
+      if (details && result.details) {
+        if (result.details.newFiles && result.details.newFiles.length > 0) {
+          response += `\n📄 New Files (first 10):\n`;
+          result.details.newFiles.forEach(f => response += `  + ${f}\n`);
+        }
+        
+        if (result.details.modifiedFiles && result.details.modifiedFiles.length > 0) {
+          response += `\n📝 Modified Files (first 10):\n`;
+          result.details.modifiedFiles.forEach(f => response += `  ~ ${f}\n`);
+        }
+        
+        if (result.details.deletedFiles && result.details.deletedFiles.length > 0) {
+          response += `\n🗑️ Deleted Files (first 10):\n`;
+          result.details.deletedFiles.forEach(f => response += `  - ${f}\n`);
+        }
+      }
+      
+      return {
+        content: [{
+          type: 'text',
+          text: response
+        }],
+        structuredContent: result
+      };
+      
+    } catch (error) {
+      return {
+        content: [{
+          type: 'text',
+          text: `Failed to check index status: ${error instanceof Error ? error.message : String(error)}`
+        }],
+        isError: true
+      };
+    }
+  });
+
+  mcpServer.registerTool(`${toolNamespace}.listDatasets`, {
+    title: 'List Project Datasets',
+    description: 'List all datasets in a project with their chunk counts and Qdrant status',
+    inputSchema: {
+      project: z.string().optional().describe('Project name (uses default if not provided)')
+    }
+  }, async ({ project }) => {
+    try {
+      const projectName = project || mcpDefaults.project;
+      
+      if (!projectName) {
+        return {
+          content: [{
+            type: 'text',
+            text: 'Project name is required. Either pass project parameter or set default with claudeContext.init'
+          }],
+          isError: true
+        };
+      }
+
+      const pool = context.getPostgresPool();
+      if (!pool) {
+        return {
+          content: [{
+            type: 'text',
+            text: 'PostgreSQL pool not configured'
+          }],
+          isError: true
+        };
+      }
+
+      // Get project ID
+      const projectResult = await pool.query(
+        'SELECT id, name FROM claude_context.projects WHERE name = $1',
+        [projectName]
+      );
+
+      if (projectResult.rows.length === 0) {
+        return {
+          content: [{
+            type: 'text',
+            text: `Project not found: ${projectName}`
           }],
           structuredContent: {
-            path,
-            hasIndex: true,
-            legacy: true,
-            collections: [{ name: collectionName, entityCount }]
+            project: projectName,
+            found: false
+          }
+        };
+      }
+
+      const projectId = projectResult.rows[0].id;
+
+      // Get all datasets for this project with collection info
+      const datasetsResult = await pool.query(
+        `SELECT 
+          d.id,
+          d.name,
+          d.description,
+          d.status,
+          d.created_at,
+          COUNT(c.id) as chunk_count,
+          dc.collection_name,
+          dc.point_count as stored_point_count
+        FROM claude_context.datasets d
+        LEFT JOIN claude_context.chunks c ON d.id = c.dataset_id
+        LEFT JOIN claude_context.dataset_collections dc ON d.id = dc.dataset_id
+        WHERE d.project_id = $1
+        GROUP BY d.id, d.name, d.description, d.status, d.created_at, dc.collection_name, dc.point_count
+        ORDER BY d.created_at DESC`,
+        [projectId]
+      );
+
+      if (datasetsResult.rows.length === 0) {
+        return {
+          content: [{
+            type: 'text',
+            text: `No datasets found for project: ${projectName}`
+          }],
+          structuredContent: {
+            project: projectName,
+            datasets: []
+          }
+        };
+      }
+
+      // Check Qdrant for vectors
+      const qdrantUrl = process.env.QDRANT_URL || 'http://localhost:6333';
+      let qdrantCollections = [];
+      try {
+        const fetch = (await import('node-fetch')).default;
+        const response = await fetch(`${qdrantUrl}/collections`);
+        const data = await response.json();
+        qdrantCollections = data?.result?.collections || [];
+      } catch (err) {
+        console.warn(`[listDatasets] Could not fetch Qdrant collections: ${err.message}`);
+      }
+
+      // Format output
+      const datasetInfos = await Promise.all(datasetsResult.rows.map(async row => {
+        console.log(`[listDatasets] 🔍 Processing dataset: ${row.name}, collection_name from DB: ${row.collection_name}`);
+        
+        let vectorCount = 0;
+        let actualCollectionName = row.collection_name || 'none';
+        
+        // If we have a collection name from dataset_collections table, use it
+        if (row.collection_name) {
+          // Find the actual Qdrant collection
+          const matchingCollection = qdrantCollections.find(col => 
+            col.name === row.collection_name
+          );
+          
+          if (matchingCollection) {
+            // Get fresh count from Qdrant
+            try {
+              const fetch = (await import('node-fetch')).default;
+              const response = await fetch(`${qdrantUrl}/collections/${row.collection_name}`);
+              const data = await response.json();
+              vectorCount = data?.result?.vectors_count || data?.result?.points_count || 0;
+            } catch (err) {
+              // Fall back to cached count
+              vectorCount = matchingCollection.points_count || matchingCollection.vectors_count || 0;
+            }
+          }
+        } else {
+          // Legacy: try to find by pattern (for backward compatibility)
+          const datasetPattern = row.name.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+          const projectPattern = projectName.replace(/-/g, '_');
+          const expectedName = `project_${projectPattern}_dataset_${datasetPattern}`;
+          
+          const matchingCollection = qdrantCollections.find(col => 
+            col.name === expectedName ||
+            (col.name && col.name.includes(projectPattern) && col.name.includes(datasetPattern))
+          );
+          
+          if (matchingCollection) {
+            actualCollectionName = matchingCollection.name;
+            vectorCount = matchingCollection.points_count || matchingCollection.vectors_count || 0;
+          }
+        }
+
+        const chunkCount = row.chunk_count ? parseInt(row.chunk_count) : 0;
+
+        return {
+          name: row.name || 'unnamed',
+          description: row.description || '',
+          status: row.status || 'unknown',
+          chunks_in_postgres: chunkCount,
+          vectors_in_qdrant: vectorCount,
+          qdrant_collection: actualCollectionName,
+          created_at: row.created_at
+        };
+      }));
+
+      const message = [
+        `📊 Datasets in project: ${projectName}`,
+        '',
+        ...datasetInfos.map(ds => 
+          `• ${ds.name}:\n` +
+          `  Status: ${ds.status}\n` +
+          `  PostgreSQL: ${ds.chunks_in_postgres.toLocaleString()} chunks\n` +
+          `  Qdrant: ${ds.vectors_in_qdrant.toLocaleString()} vectors\n` +
+          `  Collection: ${ds.qdrant_collection}\n` +
+          `  Created: ${new Date(ds.created_at).toLocaleString()}`
+        ),
+        '',
+        `Total datasets: ${datasetInfos.length}`
+      ].join('\n');
+
+      return {
+        content: [{
+          type: 'text',
+          text: message
+        }],
+        structuredContent: {
+          project: projectName,
+          datasets: datasetInfos,
+          total: datasetInfos.length
+        }
+      };
+
+    } catch (error) {
+      return {
+        content: [{
+          type: 'text',
+          text: `Failed to list datasets: ${error instanceof Error ? error.message : String(error)}`
+        }],
+        isError: true
+      };
+    }
+  });
+
+  mcpServer.registerTool(`${toolNamespace}.status`, {
+    title: 'Check Index Status & Progress',
+    description: 'Check indexing status and track operation progress. Shows active operations, completed indexes, and recent operations.',
+    inputSchema: {
+      project: z.string().optional().describe('Project name (defaults to MCP config or "all" for all operations)'),
+      dataset: z.string().optional().describe('Dataset name (defaults to MCP config)'),
+      operationId: z.string().optional().describe('Specific operation ID to check'),
+      showOperations: z.boolean().optional().describe('Show recent operations (default: false)'),
+      activeOnly: z.boolean().optional().describe('Only show active operations (default: false)')
+    }
+  }, async ({ project, dataset, operationId, showOperations, activeOnly }) => {
+    try {
+      const API_SERVER_URL = process.env.API_SERVER_URL || 'http://localhost:3030';
+      const useApiServer = process.env.USE_API_SERVER !== 'false';
+      
+      // Handle operation tracking requests
+      if (showOperations || operationId || activeOnly || project === 'all') {
+        const fetch = (await import('node-fetch')).default;
+        const targetProject = project || mcpDefaults.project || 'all';
+        
+        // Build URL with query parameters
+        let url = `${API_SERVER_URL}/projects/${targetProject}/progress`;
+        const params = new URLSearchParams();
+        if (operationId) params.append('operationId', operationId);
+        if (activeOnly) params.append('active', 'true');
+        const queryString = params.toString();
+        if (queryString) url += `?${queryString}`;
+        
+        console.log(`[Status] Checking operations: ${url}`);
+        
+        try {
+          const response = await fetch(url, { timeout: 5000 });
+          if (!response.ok) {
+            throw new Error(`API returned ${response.status}: ${response.statusText}`);
+          }
+          
+          const data = await response.json();
+          
+          // Handle single operation
+          if (operationId && data.operationId) {
+            const op = data;
+            const progressBar = '\u2588'.repeat(Math.floor(op.progress / 5)) + 
+                               '\u2591'.repeat(20 - Math.floor(op.progress / 5));
+            
+            const statusEmoji = op.status === 'completed' ? '\u2705' :
+                               op.status === 'failed' ? '\u274c' :
+                               op.status === 'in_progress' ? '\ud83d\udd04' : '\ud83c\udfc1';
+            
+            const message = [
+              `${statusEmoji} Operation Details: ${op.operationId}`,
+              '',
+              `Type: ${op.operation}`,
+              `Project: ${op.project}`,
+              op.dataset ? `Dataset: ${op.dataset}` : null,
+              `Status: ${op.status}`,
+              `Phase: ${op.phase}`,
+              `Progress: [${progressBar}] ${op.progress}%`,
+              `Message: ${op.message}`,
+              '',
+              `Started: ${new Date(op.startedAt).toLocaleString()}`,
+              `Updated: ${new Date(op.updatedAt).toLocaleString()}`,
+              op.completedAt ? `Completed: ${new Date(op.completedAt).toLocaleString()}` : null,
+              op.error ? `Error: ${op.error}` : null
+            ].filter(Boolean).join('\n');
+            
+            return {
+              content: [{ type: 'text', text: message }],
+              structuredContent: op
+            };
+          }
+          
+          // Handle multiple operations
+          const operations = data.operations || [];
+          if (operations.length === 0) {
+            return {
+              content: [{
+                type: 'text',
+                text: activeOnly ? 
+                  `No active operations found` :
+                  `No operations found`
+              }],
+              structuredContent: { operations: [] }
+            };
+          }
+          
+          // Format operations list
+          const operationLines = operations.slice(0, 10).map(op => {
+            const progressBar = '\u2588'.repeat(Math.floor(op.progress / 10)) + 
+                               '\u2591'.repeat(10 - Math.floor(op.progress / 10));
+            const statusEmoji = op.status === 'completed' ? '\u2705' :
+                                op.status === 'failed' ? '\u274c' :
+                                op.status === 'in_progress' ? '\ud83d\udd04' : '\ud83c\udfc1';
+            
+            return [
+              `${statusEmoji} ${op.operation} - ${op.project}/${op.dataset || 'default'}`,
+              `   [${progressBar}] ${op.progress}% - ${op.phase}`,
+              `   ${op.message}`,
+              `   ID: ${op.operationId.substring(0, 8)}...`
+            ].join('\n');
+          });
+          
+          const header = activeOnly ?
+            `\ud83d\udd04 Active Operations:` :
+            `\ud83d\udcca Recent Operations:`;
+          
+          return {
+            content: [{ type: 'text', text: [header, '', ...operationLines].join('\n') }],
+            structuredContent: { operations }
+          };
+        } catch (error) {
+          console.log(`[Status] Could not fetch operations: ${error.message}`);
+        }
+      }
+      
+      // Regular status check for specific project/dataset
+      const projectName = project || mcpDefaults.project;
+      
+      if (!projectName) {
+        return {
+          content: [{
+            type: 'text',
+            text: 'Project name is required. Either pass project parameter or set default with claudeContext.init'
+          }],
+          isError: true
+        };
+      }
+      
+      // Try API server first - check both progress tracking and status endpoints
+      if (API_SERVER_URL) {
+        try {
+          const fetch = (await import('node-fetch')).default;
+          
+          // First check for active operations via progress tracking
+          const progressUrl = `${API_SERVER_URL}/projects/${projectName}/progress?active=true`;
+          console.log(`[Status] Checking progress tracking: ${progressUrl}`);
+          
+          const progressResponse = await fetch(progressUrl, { timeout: 5000 });
+          if (progressResponse.ok) {
+            const progressData = await progressResponse.json();
+            const operations = progressData.operations || [];
+            
+            // Look for operations matching this dataset
+            const activeOp = operations.find(op => 
+              (!dataset || op.dataset === dataset) && 
+              (op.status === 'started' || op.status === 'in_progress')
+            );
+            
+            if (activeOp) {
+              // Show active operation progress
+              const progressBar = '█'.repeat(Math.floor(activeOp.progress / 5)) + 
+                                 '░'.repeat(20 - Math.floor(activeOp.progress / 5));
+              
+              const message = [
+                `⏳ Active Operation: ${projectName}/${activeOp.dataset || dataset}`,
+                '',
+                `Operation: ${activeOp.operation}`,
+                `Status: ${activeOp.status}`,
+                `Phase: ${activeOp.phase}`,
+                `Progress: [${progressBar}] ${activeOp.progress}%`,
+                `Message: ${activeOp.message}`,
+                `Started: ${new Date(activeOp.startedAt).toLocaleTimeString()}`,
+                activeOp.operationId ? `ID: ${activeOp.operationId}` : ''
+              ].filter(Boolean).join('\n');
+              
+              return {
+                content: [{ type: 'text', text: message }],
+                structuredContent: {
+                  project: projectName,
+                  dataset: activeOp.dataset || dataset,
+                  activeOperation: activeOp
+                }
+              };
+            }
+          }
+          
+          // Then check the status endpoint for completed/stored status
+          const url = `${API_SERVER_URL}/projects/${projectName}/status?dataset=${encodeURIComponent(dataset)}`;
+          console.log(`[Status] Checking status API: ${url}`);
+          
+          const response = await fetch(url, { timeout: 5000 });
+          const data = await response.json();
+          
+          if (response.ok && data.status !== 'not_found') {
+            // API server returned valid status
+            const percentage = data.percentage || 0;
+            const statusEmoji = data.status === 'completed' ? '✅' : 
+                               data.status === 'indexing' ? '⏳' : 
+                               data.status === 'empty' ? '📭' : '❓';
+            
+            const message = [
+              `${statusEmoji} Indexing Status: ${projectName}/${dataset}`,
+              '',
+              `Status: ${data.status}`,
+              `Progress: ${data.stored.toLocaleString()} / ${data.expected.toLocaleString()} chunks (${percentage}%)`,
+              `PostgreSQL: ${data.chunks_in_postgres.toLocaleString()} chunks`,
+              `Qdrant: ${data.vectors_in_qdrant.toLocaleString()} vectors`,
+              `Updated: ${new Date(data.timestamp).toLocaleTimeString()}`
+            ].join('\n');
+            
+            return {
+              content: [{ type: 'text', text: message }],
+              structuredContent: {
+                project: projectName,
+                dataset,
+                ...data
+              }
+            };
+          }
+        } catch (err) {
+          console.log(`[Status] API server unavailable, falling back to in-memory: ${err.message}`);
+        }
+      }
+      
+      // Fallback to in-memory tracker
+      if (dataset) {
+        const progressKey = `${projectName}/${dataset}`;
+        let progress = indexingProgress.get(progressKey);
+        
+        // Try case-insensitive lookup if exact match fails
+        if (!progress) {
+          const lowerKey = progressKey.toLowerCase();
+          for (const [key, value] of indexingProgress.entries()) {
+            if (key.toLowerCase() === lowerKey) {
+              progress = value;
+              break;
+            }
+          }
+        }
+        
+        // Debug: log all available keys
+        console.log(`[Status] Looking for key: ${progressKey}`);
+        console.log(`[Status] Available keys: ${Array.from(indexingProgress.keys()).join(', ')}`);
+        
+        if (!progress) {
+          // Also check if completed indexing exists in DB
+          const pool = context?.getPostgresPool?.();
+          if (pool) {
+            try {
+              const result = await pool.query(`
+                SELECT COUNT(c.id) as chunk_count
+                FROM claude_context.chunks c
+                JOIN claude_context.datasets d ON c.dataset_id = d.id
+                JOIN claude_context.projects p ON d.project_id = p.id
+                WHERE p.name = $1 AND d.name = $2
+              `, [projectName, dataset]);
+              
+              const chunkCount = parseInt(result.rows[0]?.chunk_count || 0);
+              console.log(`[Status] DB query result: ${chunkCount} chunks for ${projectName}/${dataset}`);
+              if (chunkCount > 0) {
+                // Found in database, create synthetic progress
+                progress = {
+                  expected: chunkCount,
+                  stored: chunkCount,
+                  status: 'completed',
+                  startTime: Date.now() - 1000,
+                  endTime: Date.now()
+                };
+                // Cache it for future lookups
+                indexingProgress.set(progressKey, progress);
+              }
+            } catch (err) {
+              console.log(`[Status] Could not check DB: ${err.message}`);
+            }
+          }
+          
+          if (!progress) {
+            // Last resort: check Qdrant directly via HTTP API
+            try {
+              const qdrantUrl = process.env.QDRANT_URL || 'http://localhost:6333';
+              const fetch = (await import('node-fetch')).default;
+              
+              // List collections
+              const collectionsResp = await fetch(`${qdrantUrl}/collections`);
+              const collectionsData = await collectionsResp.json();
+              
+              // Get first collection (hybrid_code_chunks_*)
+              const collection = collectionsData?.result?.collections?.[0];
+              if (collection && collection.name) {
+                // Get collection details
+                const statsResp = await fetch(`${qdrantUrl}/collections/${collection.name}`);
+                const statsData = await statsResp.json();
+                const pointsCount = statsData?.result?.points_count || 0;
+                
+                console.log(`[Status] Qdrant collection ${collection.name}: ${pointsCount} points`);
+                if (pointsCount > 0) {
+                  // Found data in Qdrant, create synthetic progress
+                  progress = {
+                    expected: pointsCount,
+                    stored: pointsCount,
+                    status: 'completed',
+                    startTime: Date.now() - 60000, // Assume completed 1 minute ago
+                    endTime: Date.now() - 1000
+                  };
+                  // Cache it
+                  indexingProgress.set(progressKey, progress);
+                }
+              }
+            } catch (err) {
+              console.log(`[Status] Could not check Qdrant: ${err.message}`);
+            }
+            
+            if (!progress) {
+              return {
+                content: [{
+                  type: 'text',
+                  text: `No indexing in progress or completed for "${projectName}/${dataset}"\nAvailable progress keys: ${Array.from(indexingProgress.keys()).join(', ')}`
+                }],
+                structuredContent: {
+                  project: projectName,
+                  dataset,
+                  found: false,
+                  availableKeys: Array.from(indexingProgress.keys())
+                }
+              };
+            }
+          }
+        }
+        
+        const percentage = progress.expected > 0 
+          ? Math.round((progress.stored / progress.expected) * 100) 
+          : 0;
+        
+        const duration = progress.endTime 
+          ? ((progress.endTime - progress.startTime) / 1000).toFixed(1)
+          : ((Date.now() - progress.startTime) / 1000).toFixed(1);
+        
+        let statusEmoji = '⏳';
+        if (progress.status === 'completed') statusEmoji = '✅';
+        else if (progress.status === 'failed' || progress.status === 'error') statusEmoji = '❌';
+        
+        const message = [
+          `${statusEmoji} Indexing Status: ${projectName}/${dataset}`,
+          '',
+          `Status: ${progress.status}`,
+          `Progress: ${progress.stored.toLocaleString()} / ${progress.expected.toLocaleString()} chunks (${percentage}%)`,
+          `Duration: ${duration}s`,
+          progress.phase ? `Phase: ${progress.phase}` : null,
+          progress.error ? `Error: ${progress.error}` : null
+        ].filter(Boolean).join('\n');
+        
+        return {
+          content: [{ type: 'text', text: message }],
+          structuredContent: {
+            project: projectName,
+            dataset,
+            ...progress,
+            percentage,
+            duration: parseFloat(duration)
           }
         };
       }
       
-      throw new Error('Either project or path is required');
+      // Show all datasets for project
+      const allProgress = [];
+      for (const [key, progress] of indexingProgress.entries()) {
+        if (key.startsWith(`${projectName}/`)) {
+          const datasetName = key.split('/')[1];
+          const percentage = progress.expected > 0 
+            ? Math.round((progress.stored / progress.expected) * 100) 
+            : 0;
+          allProgress.push({ dataset: datasetName, ...progress, percentage });
+        }
+      }
+      
+      if (allProgress.length === 0) {
+        return {
+          content: [{
+            type: 'text',
+            text: `No indexing in progress or completed for project "${projectName}"`
+          }],
+          structuredContent: {
+            project: projectName,
+            datasets: []
+          }
+        };
+      }
+      
+      const lines = allProgress.map(p => {
+        let emoji = '⏳';
+        if (p.status === 'completed') emoji = '✅';
+        else if (p.status === 'failed' || p.status === 'error') emoji = '❌';
+        return `${emoji} ${p.dataset}: ${p.stored.toLocaleString()}/${p.expected.toLocaleString()} chunks (${p.percentage}%) - ${p.status}`;
+      });
+      
+      const message = [
+        `📊 Indexing Status for Project "${projectName}"`,
+        '',
+        `Active/Completed: ${allProgress.length} dataset(s)`,
+        '',
+        ...lines
+      ].join('\n');
+      
+      return {
+        content: [{ type: 'text', text: message }],
+        structuredContent: {
+          project: projectName,
+          datasets: allProgress
+        }
+      };
     } catch (error) {
       return {
         content: [{
@@ -900,172 +1741,19 @@ async function main() {
     }
   });
 
-  mcpServer.registerTool(`${toolNamespace}.clear`, {
-    title: 'Clear Index',
-    description: 'Delete collections for a project/dataset or legacy path. With Island Architecture, deletes project-scoped collections and database records.',
-    inputSchema: {
-      path: z.string().optional().describe('Absolute path (legacy mode)'),
-      project: z.string().optional().describe('Project name'),
-      dataset: z.string().optional().describe('Dataset name (if omitted, clears all project datasets)'),
-      dryRun: z.boolean().optional().describe('Report what would happen without deleting data')
-    }
-  }, async ({ path, project, dataset, dryRun }) => {
-    try {
-      const projectName = project || mcpDefaults.project;
-      const poolInstance = context.getPostgresPool();
-      const vectorDatabase = context.getVectorDatabase();
-      
-      // Island Architecture mode
-      if (projectName && poolInstance) {
-        const client = await poolInstance.connect();
-        try {
-          const datasetName = dataset || mcpDefaults.dataset;
-          
-          // Get collections to delete
-          let query, params;
-          if (datasetName) {
-            query = `
-              SELECT dc.collection_name
-              FROM claude_context.dataset_collections dc
-              JOIN claude_context.datasets d ON dc.dataset_id = d.id
-              JOIN claude_context.projects p ON d.project_id = p.id
-              WHERE p.name = $1 AND d.name = $2
-            `;
-            params = [projectName, datasetName];
-          } else {
-            query = `
-              SELECT dc.collection_name
-              FROM claude_context.dataset_collections dc
-              JOIN claude_context.datasets d ON dc.dataset_id = d.id
-              JOIN claude_context.projects p ON d.project_id = p.id
-              WHERE p.name = $1
-            `;
-            params = [projectName];
-          }
-          
-          const result = await client.query(query, params);
-          const collections = result.rows.map(r => r.collection_name);
-          
-          if (collections.length === 0) {
-            return {
-              content: [{
-                type: 'text',
-                text: `No collections found for project "${projectName}"${datasetName ? ` / dataset "${datasetName}"` : ''}`
-              }],
-              structuredContent: {
-                project: projectName,
-                dataset: datasetName,
-                collectionsDeleted: 0
-              }
-            };
-          }
-          
-          if (dryRun) {
-            return {
-              content: [{
-                type: 'text',
-                text: `🔍 Dry run - would delete:\n\nProject: ${projectName}${datasetName ? `\nDataset: ${datasetName}` : ''}\n\nCollections (${collections.length}):\n${collections.map(c => `  • ${c}`).join('\n')}`
-              }],
-              structuredContent: {
-                dryRun: true,
-                project: projectName,
-                dataset: datasetName,
-                collections
-              }
-            };
-          }
-          
-          // Delete collections from vector database
-          let deletedCount = 0;
-          for (const collectionName of collections) {
-            try {
-              if (await vectorDatabase.hasCollection(collectionName)) {
-                await vectorDatabase.dropCollection(collectionName);
-                deletedCount++;
-              }
-            } catch (err) {
-              console.error(`Failed to drop collection ${collectionName}:`, err);
-            }
-          }
-          
-          // Delete from database
-          if (datasetName) {
-            await client.query(`
-              DELETE FROM claude_context.dataset_collections
-              WHERE collection_name = ANY($1)
-            `, [collections]);
-          } else {
-            await client.query(`
-              DELETE FROM claude_context.dataset_collections dc
-              USING claude_context.datasets d, claude_context.projects p
-              WHERE dc.dataset_id = d.id
-                AND d.project_id = p.id
-                AND p.name = $1
-            `, [projectName]);
-          }
-          
-          return {
-            content: [{
-              type: 'text',
-              text: `✅ Cleared ${deletedCount} collection(s)\n\nProject: ${projectName}${datasetName ? `\nDataset: ${datasetName}` : ''}\n\nDeleted collections:\n${collections.map(c => `  • ${c}`).join('\n')}`
-            }],
-            structuredContent: {
-              project: projectName,
-              dataset: datasetName,
-              collectionsDeleted: deletedCount,
-              collections
-            }
-          };
-        } finally {
-          client.release();
-        }
-      }
-      
-      // Legacy mode
-      if (path) {
-        if (dryRun) {
-          return {
-            content: [{
-              type: 'text',
-              text: `⚠️  Dry run (legacy mode): would clear embeddings for ${path}\n\nNote: Path-based indexing is deprecated. Use project/dataset instead.`
-            }],
-            structuredContent: { path, dryRun: true, legacy: true }
-          };
-        }
-        
-        console.warn('[MCP] Legacy clearIndex is deprecated');
-        await context.clearIndex(path);
-        return {
-          content: [{
-            type: 'text',
-            text: `⚠️  Cleared embeddings for ${path} (legacy mode)\n\nNote: Path-based indexing is deprecated. Migrate to Island Architecture.`
-          }],
-          structuredContent: { path, cleared: true, legacy: true }
-        };
-      }
-      
-      throw new Error('Either project or path is required');
-    } catch (error) {
-      return {
-        content: [{
-          type: 'text',
-          text: `Clear failed: ${error instanceof Error ? error.message : String(error)}`
-        }],
-        isError: true
-      };
-    }
-  });
+
+
 
   // Crawl4AI Service Tools
   mcpServer.registerTool(`${toolNamespace}.crawl`, {
     title: 'Crawl Web Pages',
-    description: 'Trigger crawl4ai service to crawl and index web pages with chunking, code detection, and AI summaries',
+    description: 'Trigger crawl4ai service to crawl and index web pages. Modes: single (1 page), batch (multiple URLs), recursive (follow links), sitemap (parse sitemap.xml). Dataset auto-generated from domain (e.g., docs-example-com). Defaults: scope="project", mode="single"',
     inputSchema: {
       url: z.string().url().describe('URL to crawl'),
       project: z.string().optional().describe('Project name for storage isolation'),
-      dataset: z.string().optional().describe('Dataset name for storage isolation'),
-      scope: z.enum(['global', 'local', 'project']).optional().describe('Knowledge scope (default: local)'),
-      mode: z.enum(['single', 'batch', 'recursive', 'sitemap']).optional().describe('Crawling mode (default: single)'),
+      dataset: z.string().optional().describe('Dataset name (default: auto-generated from domain, e.g., "docs-example-com")'),
+      scope: z.enum(['global', 'local', 'project']).optional().describe('Knowledge scope - global: shared across projects, local: local only, project: project-scoped (default: "project")'),
+      mode: z.enum(['single', 'batch', 'recursive', 'sitemap']).optional().describe('Crawling mode - single: one page, batch: multiple URLs, recursive: follow links, sitemap: parse sitemap.xml (default: "single")'),
       maxDepth: z.number().optional().describe('Maximum depth for recursive crawling (default: 1)'),
       autoDiscovery: z.boolean().optional().describe('Auto-discover llms.txt and sitemaps (default: true)'),
       extractCode: z.boolean().optional().describe('Extract code examples (default: true)')
@@ -1074,12 +1762,16 @@ async function main() {
     try {
       const fetch = (await import('node-fetch')).default;
       
-      // Start crawl
+      // Extract domain from URL for dataset suggestion
+      const urlObj = new URL(url);
+      const domainName = urlObj.hostname.replace(/^www\./, '').replace(/\./g, '-');
+      
+      // Start crawl with better defaults
       const crawlRequest = {
         urls: [url],
         project: project || mcpDefaults.project,
-        dataset: dataset || mcpDefaults.dataset,
-        scope,
+        dataset: dataset || domainName,  // Default to domain name (e.g., "docs-example-com")
+        scope: scope || 'project',  // Default to "project"
         mode: mode || 'single',
         max_depth: maxDepth || 1,
         auto_discovery: autoDiscovery !== false,
@@ -1098,55 +1790,27 @@ async function main() {
 
       const { progress_id, status } = await startResponse.json();
 
-      // Poll progress until complete
-      let attempts = 0;
-      const maxAttempts = 120; // 2 minutes max
+      // Return immediately with progress_id - don't wait for completion
+      const projectName = project || mcpDefaults.project || 'default';
+      const datasetName = dataset || domainName;
+      const scopeName = scope || 'project';
       
-      while (attempts < maxAttempts) {
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        
-        const progressResponse = await fetch(`http://localhost:7070/progress/${progress_id}`);
-        if (!progressResponse.ok) {
-          throw new Error(`Progress check failed: ${progressResponse.statusText}`);
-        }
-
-        const progress = await progressResponse.json();
-        
-        if (progress.status === 'completed') {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: `Crawl completed successfully!\n\nProject: ${project || 'default'}\nDataset: ${dataset || 'default'}\nScope: ${scope || 'local'}\n\nProcessed: ${progress.processed_pages || 0} pages\nChunks stored: ${progress.chunks_stored || 0}\nProgress: ${progress.progress}%`
-              }
-            ],
-            structuredContent: {
-              progress_id,
-              status: progress.status,
-              chunks_stored: progress.chunks_stored,
-              processed_pages: progress.processed_pages
-            }
-          };
-        }
-        
-        if (progress.status === 'failed' || progress.status === 'cancelled') {
-          throw new Error(`Crawl ${progress.status}: ${progress.log}`);
-        }
-        
-        attempts++;
-      }
-
       return {
         content: [
           {
             type: 'text',
-            text: `Crawl still running after 2 minutes. Progress ID: ${progress_id}. Use crawlStatus to check progress.`
+            text: `✅ Crawl started successfully!\n\n📋 Details:\n  • Progress ID: ${progress_id}\n  • URL: ${url}\n  • Project: ${projectName}\n  • Dataset: ${datasetName}\n  • Scope: ${scopeName}\n  • Mode: ${mode || 'single'}\n\n🔍 Check progress with:\n  claudeContext.crawlStatus("${progress_id}")`
           }
         ],
         structuredContent: {
           progress_id,
-          status: 'running',
-          timeout: true
+          url,
+          project: projectName,
+          dataset: datasetName,
+          scope: scopeName,
+          mode: mode || 'single',
+          status: 'started',
+          message: `Use claudeContext.crawlStatus("${progress_id}") to check progress`
         }
       };
 
@@ -1246,127 +1910,7 @@ async function main() {
     }
   });
 
-  // Retrieval Tools
-  mcpServer.registerTool(`${toolNamespace}.searchChunks`, {
-    title: 'Search Chunks',
-    description: 'Search for chunks with scope filtering, code/text filtering, and similarity ranking',
-    inputSchema: {
-      query: z.string().describe('Search query'),
-      project: z.string().optional().describe('Project name for filtering'),
-      dataset: z.string().optional().describe('Dataset name for filtering'),
-      scope: z.enum(['global', 'local', 'project', 'all']).optional().describe('Scope level for filtering'),
-      filterCode: z.boolean().optional().describe('Only return code chunks'),
-      filterText: z.boolean().optional().describe('Only return text chunks'),
-      limit: z.number().optional().describe('Maximum results (default: 10)')
-    }
-  }, async ({ query, project, dataset, scope, filterCode, filterText, limit }) => {
-    try {
-      const fetch = (await import('node-fetch')).default;
-      
-      const searchRequest = {
-        query,
-        project: project || mcpDefaults.project,
-        dataset: dataset || mcpDefaults.dataset,
-        scope,
-        filter_code: filterCode,
-        filter_text: filterText,
-        limit: limit || 10
-      };
 
-      const response = await fetch('http://localhost:7070/search', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(searchRequest)
-      });
-
-      if (!response.ok) {
-        throw new Error(`Search failed: ${response.statusText}`);
-      }
-
-      const data = await response.json();
-      
-      // Format results
-      let resultText = `Found ${data.total} chunks for query: "${data.query}"\n\n`;
-      
-      data.results.forEach((chunk, idx) => {
-        resultText += `[${idx + 1}] ${chunk.is_code ? 'CODE' : 'TEXT'} (${chunk.language}) - Score: ${chunk.similarity_score.toFixed(3)}\n`;
-        resultText += `Source: ${chunk.relative_path}\n`;
-        resultText += `Summary: ${chunk.summary}\n`;
-        resultText += `Content (first 200 chars): ${chunk.chunk_text.substring(0, 200)}...\n`;
-        resultText += `Scope: ${chunk.scope} | Model: ${chunk.model_used}\n\n`;
-      });
-      
-      return {
-        content: [
-          {
-            type: 'text',
-            text: resultText
-          }
-        ],
-        structuredContent: data
-      };
-
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Search failed: ${error instanceof Error ? error.message : String(error)}`
-          }
-        ],
-        isError: true
-      };
-    }
-  });
-
-  mcpServer.registerTool(`${toolNamespace}.getChunk`, {
-    title: 'Get Chunk',
-    description: 'Retrieve a specific chunk by ID',
-    inputSchema: {
-      chunkId: z.string().describe('Chunk ID'),
-      includeContext: z.boolean().optional().describe('Include surrounding chunks (not yet implemented)')
-    }
-  }, async ({ chunkId, includeContext }) => {
-    try {
-      const fetch = (await import('node-fetch')).default;
-      
-      const response = await fetch(`http://localhost:7070/chunk/${chunkId}`);
-
-      if (!response.ok) {
-        throw new Error(`Get chunk failed: ${response.statusText}`);
-      }
-
-      const chunk = await response.json();
-      
-      const resultText = `Chunk ID: ${chunk.id}\n` +
-        `Type: ${chunk.is_code ? 'CODE' : 'TEXT'} (${chunk.language})\n` +
-        `Source: ${chunk.relative_path} (chunk ${chunk.chunk_index})\n` +
-        `Scope: ${chunk.scope} | Model: ${chunk.model_used}\n\n` +
-        `Summary:\n${chunk.summary}\n\n` +
-        `Full Content:\n${chunk.chunk_text}`;
-      
-      return {
-        content: [
-          {
-            type: 'text',
-            text: resultText
-          }
-        ],
-        structuredContent: chunk
-      };
-
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Get chunk failed: ${error instanceof Error ? error.message : String(error)}`
-          }
-        ],
-        isError: true
-      };
-    }
-  });
 
   mcpServer.registerTool(`${toolNamespace}.listScopes`, {
     title: 'List Scopes',
@@ -1428,247 +1972,87 @@ async function main() {
     }
   });
 
-  // ==================================================================================
-  // Web Content Tools
-  // ==================================================================================
 
-  mcpServer.registerTool(`${toolNamespace}.index_web_pages`, {
-    title: 'Index Web Pages',
-    description: 'Index web pages into the knowledge graph with full text + vector + SPLADE hybrid search',
+  // =============================================================================
+  // GitHub Ingestion Tool
+  // =============================================================================
+
+  mcpServer.registerTool(`${toolNamespace}.indexGitHub`, {
+    title: 'Index GitHub Repository',
+    description: 'Clone and index a GitHub repository into the vector database for semantic search. Automatically parses code into chunks, generates embeddings, and stores them. Runs asynchronously with job queue - use waitForCompletion to wait for results.',
     inputSchema: {
-      urls: z.array(z.string()).describe('URLs to crawl and index'),
-      project: z.string().optional().describe('Project name (defaults to MCP config)'),
-      dataset: z.string().optional().describe('Dataset name (defaults to MCP config)'),
-      forceReindex: z.boolean().optional().describe('Force re-indexing even if pages already exist')
+      repo: z.string().describe('GitHub repository URL in format: github.com/owner/repo or https://github.com/owner/repo'),
+      branch: z.string().optional().describe('Branch name (default: main)'),
+      dataset: z.string().optional().describe('Dataset name (defaults to repo name)'),
+      project: z.string().optional().describe('Project name (uses default if not provided)'),
+      scope: z.enum(['global', 'project', 'local']).optional().describe('Scope level (default: project)'),
+      force: z.boolean().optional().describe('Force reindex even if already exists'),
+      waitForCompletion: z.boolean().optional().describe('Wait for job to complete (default: true)')
     }
-  }, async ({ urls, project, dataset, forceReindex }) => {
+  }, async ({ repo, branch, dataset, project, scope, force, waitForCompletion = true }) => {
     try {
-      const projectName = project || mcpDefaults.project;
-      const datasetName = dataset || mcpDefaults.dataset;
-
+      const projectName = project || getCurrentProject();
       if (!projectName) {
-        return {
-          content: [{
-            type: 'text',
-            text: 'Error: No project specified and no default project configured. Use set_defaults tool first.'
-          }],
-          isError: true
-        };
+        throw new Error('Project is required. Set a default via claudeContext.init or pass project explicitly.');
       }
 
-      // Crawl pages using Crawl4AI service
-      const crawlClient = context.getCrawl4AIClient && context.getCrawl4AIClient();
-      if (!crawlClient) {
-        return {
-          content: [{
-            type: 'text',
-            text: 'Error: Crawl4AI client not configured. Set CRAWL4AI_URL environment variable.'
-          }],
-          isError: true
-        };
-      }
-
-      const progressUpdates = [];
-      const pages = await crawlClient.crawlPages(urls);
-
-      // Ingest pages using unified pipeline
-      const result = await ingestWebPages(context, {
-        project: projectName,
-        dataset: datasetName,
-        pages,
-        forceReindex
-      }, (phase, percentage, detail) => {
-        progressUpdates.push({ phase, percentage, detail, timestamp: new Date().toISOString() });
-        console.log(`[Web Ingest] ${phase}: ${percentage}% - ${detail}`);
+      const response = await apiRequest(`/projects/${projectName}/ingest/github`, {
+        method: 'POST',
+        body: JSON.stringify({
+          repo,
+          branch: branch || 'main',
+          dataset,
+          scope: scope || 'project',
+          force: force || false
+        })
       });
 
-      const summary = [
-        `✅ Indexed ${result.stats.processedPages} web pages`,
-        `📄 Generated ${result.stats.totalChunks} chunks`,
-        `🎯 Project: ${projectName}`,
-        datasetName ? `📦 Dataset: ${datasetName}` : '',
-        `⏱️ Duration: ${result.metadata.timing.total}ms`
-      ].filter(Boolean).join('\n');
+      if (response.status === 'skipped') {
+        return {
+          content: [{
+            type: 'text',
+            text: `Repository already indexed.\nProject: ${response.project}\nDataset: ${response.dataset}\nRepository: ${response.repository}\n\nUse force: true to reindex.`
+          }],
+          structuredContent: response
+        };
+      }
+
+      if (!waitForCompletion) {
+        return {
+          content: [{
+            type: 'text',
+            text: `GitHub ingestion job queued.\nJob ID: ${response.jobId}\nProject: ${response.project}\nDataset: ${response.dataset}\nRepository: ${response.repository}\nBranch: ${response.branch}`
+          }],
+          structuredContent: response
+        };
+      }
+
+      // Wait for completion
+      const result = await pollJobCompletion(response.jobId, projectName);
+      
+      if (result.status === 'timeout') {
+        return {
+          content: [{
+            type: 'text',
+            text: `Job still running after 2 minutes.\nJob ID: ${response.jobId}\nCheck status with claudeContext.listDatasets`
+          }],
+          structuredContent: { ...response, timeout: true }
+        };
+      }
 
       return {
         content: [{
           type: 'text',
-          text: summary
+          text: `✅ GitHub repository indexed successfully!\n\n${result.job.summary}\nDuration: ${result.job.duration}`
         }],
-        structuredContent: {
-          project: projectName,
-          dataset: datasetName,
-          urls,
-          stats: result.stats,
-          progress: progressUpdates
-        }
+        structuredContent: { ...response, job: result.job }
       };
+
     } catch (error) {
       return {
         content: [{
           type: 'text',
-          text: `Web indexing failed: ${error instanceof Error ? error.message : String(error)}`
-        }],
-        isError: true
-      };
-    }
-  });
-
-  mcpServer.registerTool(`${toolNamespace}.query_web_content`, {
-    title: 'Query Web Content',
-    description: 'Search indexed web content with hybrid dense + sparse vector search',
-    inputSchema: {
-      query: z.string().describe('Search query'),
-      project: z.string().optional().describe('Project name (defaults to MCP config)'),
-      dataset: z.string().optional().describe('Dataset name (defaults to MCP config)'),
-      topK: z.number().optional().describe('Number of results to return (default: 10)'),
-      useReranking: z.boolean().optional().describe('Apply cross-encoder reranking (default: true)')
-    }
-  }, async ({ query, project, dataset, topK, useReranking }) => {
-    try {
-      const projectName = project || mcpDefaults.project;
-      const datasetName = dataset || mcpDefaults.dataset;
-
-      if (!projectName) {
-        return {
-          content: [{
-            type: 'text',
-            text: 'Error: No project specified and no default project configured.'
-          }],
-          isError: true
-        };
-      }
-
-      const result = await queryWebContent(context, {
-        project: projectName,
-        dataset: datasetName,
-        query,
-        topK: topK || 10,
-        useReranking: useReranking !== false
-      });
-
-      if (!result.results.length) {
-        return {
-          content: [{
-            type: 'text',
-            text: `No web content found for query: "${query}"`
-          }],
-          structuredContent: {
-            project: projectName,
-            query,
-            results: []
-          }
-        };
-      }
-
-      const formatted = result.results.map((r, idx) => {
-        const scoreInfo = [];
-        if (r.scores.dense) scoreInfo.push(`Dense: ${r.scores.dense.toFixed(3)}`);
-        if (r.scores.sparse) scoreInfo.push(`Sparse: ${r.scores.sparse.toFixed(3)}`);
-        if (r.scores.rerank) scoreInfo.push(`Rerank: ${r.scores.rerank.toFixed(3)}`);
-        scoreInfo.push(`Final: ${r.scores.final.toFixed(3)}`);
-
-        return [
-          `#${idx + 1} ${r.title || r.url}`,
-          `URL: ${r.url}`,
-          `Scores: ${scoreInfo.join(' | ')}`,
-          `Domain: ${r.domain}`,
-          `\n${r.content.substring(0, 300)}${r.content.length > 300 ? '...' : ''}`
-        ].join('\n');
-      }).join('\n\n---\n\n');
-
-      return {
-        content: [{
-          type: 'text',
-          text: formatted
-        }],
-        structuredContent: {
-          project: projectName,
-          dataset: datasetName,
-          query,
-          results: result.results,
-          metadata: result.metadata
-        }
-      };
-    } catch (error) {
-      return {
-        content: [{
-          type: 'text',
-          text: `Web query failed: ${error instanceof Error ? error.message : String(error)}`
-        }],
-        isError: true
-      };
-    }
-  });
-
-  mcpServer.registerTool(`${toolNamespace}.smart_query_web`, {
-    title: 'Smart Query Web Content',
-    description: 'Query web content with LLM-enhanced retrieval and answer generation',
-    inputSchema: {
-      query: z.string().describe('Natural language question'),
-      project: z.string().optional().describe('Project name (defaults to MCP config)'),
-      dataset: z.string().optional().describe('Dataset name (defaults to MCP config)'),
-      strategies: z.array(z.enum(['hypothetical_document', 'multi_query', 'step_back'])).optional()
-        .describe('Query enhancement strategies to apply'),
-      answerType: z.enum(['paragraph', 'list', 'table', 'code', 'concise']).optional()
-        .describe('Desired answer format (default: paragraph)')
-    }
-  }, async ({ query, project, dataset, strategies, answerType }) => {
-    try {
-      const projectName = project || mcpDefaults.project;
-      const datasetName = dataset || mcpDefaults.dataset;
-
-      if (!projectName) {
-        return {
-          content: [{
-            type: 'text',
-            text: 'Error: No project specified and no default project configured.'
-          }],
-          isError: true
-        };
-      }
-
-      const result = await smartQueryWebContent(context, {
-        project: projectName,
-        dataset: datasetName,
-        query,
-        strategies,
-        answerType
-      });
-
-      const sources = result.retrievals.map((r, idx) => 
-        `[${idx + 1}] ${r.title || r.url} (score: ${r.scores.final.toFixed(3)})`
-      ).join('\n');
-
-      const output = [
-        `🤖 Answer:`,
-        result.answer.content,
-        ``,
-        `📚 Sources:`,
-        sources,
-        ``,
-        `⏱️ Query Time: ${result.metadata.timing.total}ms`
-      ].join('\n');
-
-      return {
-        content: [{
-          type: 'text',
-          text: output
-        }],
-        structuredContent: {
-          project: projectName,
-          dataset: datasetName,
-          query,
-          answer: result.answer.content,
-          sources: result.retrievals,
-          metadata: result.metadata
-        }
-      };
-    } catch (error) {
-      return {
-        content: [{
-          type: 'text',
-          text: `Smart web query failed: ${error instanceof Error ? error.message : String(error)}`
+          text: `GitHub indexing failed: ${error instanceof Error ? error.message : String(error)}`
         }],
         isError: true
       };

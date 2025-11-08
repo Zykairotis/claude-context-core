@@ -47,6 +47,22 @@ const DEFAULT_IGNORE_PATTERNS = [
     'target/**',
     'coverage/**',
     '.nyc_output/**',
+    
+    // Next.js build directories
+    '.next/**',
+    '.next/cache/**',
+    '.next/server/**',
+    '.next/static/**',
+    '.next/dev/**',
+    
+    // Other framework build directories
+    '.nuxt/**',
+    '.vuepress/**',
+    '.gatsby-cache/**',
+    '.vercel/**',
+    '.turbo/**',
+    '.parcel-cache/**',
+    '.webpack/**',
 
     // IDE and editor files
     '.vscode/**',
@@ -86,9 +102,11 @@ const DEFAULT_IGNORE_PATTERNS = [
     '*.polyfills.js',
     '*.runtime.js',
     '*.map', // source map files
+    
+    // Additional duplicates for consistency
     'node_modules', '.git', '.svn', '.hg', 'build', 'dist', 'out',
     'target', '.vscode', '.idea', '__pycache__', '.pytest_cache',
-    'coverage', '.nyc_output', 'logs', 'tmp', 'temp'
+    'coverage', '.nyc_output', 'logs', 'tmp', 'temp', '.next'
 ];
 
 export interface ContextConfig {
@@ -773,6 +791,41 @@ export class Context {
     }
 
     /**
+     * Prepare vector collection with scope-based naming (Island Architecture)
+     */
+    private async prepareCollectionScoped(collectionName: string, forceReindex: boolean = false): Promise<void> {
+        const isHybrid = this.getIsHybrid();
+        const collectionType = isHybrid === true ? 'hybrid vector' : 'vector';
+        console.log(`[Context] 🔧 Preparing ${collectionType} collection: ${collectionName}${forceReindex ? ' (FORCE REINDEX)' : ''}`);
+
+        // Check if collection already exists
+        const collectionExists = await this.vectorDatabase.hasCollection(collectionName);
+
+        if (collectionExists && !forceReindex) {
+            console.log(`📋 Collection ${collectionName} already exists, skipping creation`);
+            return;
+        }
+
+        if (collectionExists && forceReindex) {
+            console.log(`[Context] 🗑️  Dropping existing collection ${collectionName} for force reindex...`);
+            await this.vectorDatabase.dropCollection(collectionName);
+            console.log(`[Context] ✅ Collection ${collectionName} dropped successfully`);
+        }
+
+        console.log(`[Context] 🔍 Detecting embedding dimension for ${this.embedding.getProvider()} provider...`);
+        const dimension = await this.embedding.detectDimension();
+        console.log(`[Context] 📏 Detected dimension: ${dimension} for ${this.embedding.getProvider()}`);
+
+        if (isHybrid === true) {
+            await this.vectorDatabase.createHybridCollection(collectionName, dimension, `Hybrid Index`);
+        } else {
+            await this.vectorDatabase.createCollection(collectionName, dimension, `Index`);
+        }
+
+        console.log(`[Context] ✅ Collection ${collectionName} created successfully (dimension: ${dimension})`);
+    }
+
+    /**
      * Recursively get all code files in the codebase
      */
     private async getCodeFiles(codebasePath: string): Promise<string[]> {
@@ -830,7 +883,12 @@ export class Context {
             const filePath = filePaths[i];
 
             try {
-                const content = await fs.promises.readFile(filePath, 'utf-8');
+                let content = await fs.promises.readFile(filePath, 'utf-8');
+                
+                // Sanitize Unicode to prevent "lone leading surrogate" errors
+                // Replace invalid Unicode characters with replacement character
+                content = content.replace(/[\uD800-\uDFFF]/g, '\uFFFD');
+                
                 const language = this.getLanguageFromExtension(path.extname(filePath));
                 const chunks = await this.codeSplitter.split(content, language, filePath);
 
@@ -926,7 +984,7 @@ export class Context {
      */
     private async processChunkBatch(
         chunks: CodeChunk[], 
-        codebasePath: string,
+        collectionNameOrPath: string,
         projectContext?: ProjectContext,
         provenance?: ProvenanceInfo
     ): Promise<void> {
@@ -935,6 +993,18 @@ export class Context {
         if (this.chunkStatsEnabled) {
             this.logChunkStats(chunks);
         }
+
+        // Determine if this is a collection name or codebase path
+        // Collection names follow patterns like "project_x_dataset_y" or "global_knowledge"
+        // Codebase paths are file system paths
+        const isCollectionName = collectionNameOrPath.startsWith('project_') || 
+                                collectionNameOrPath.startsWith('global_') ||
+                                collectionNameOrPath.includes('_dataset_');
+        
+        // Get the actual collection name and codebase path
+        const collectionName = isCollectionName ? collectionNameOrPath : this.getCollectionName(collectionNameOrPath);
+        const codebasePath = projectContext ? chunks[0]?.metadata?.filePath ? 
+            path.dirname(chunks[0].metadata.filePath) : collectionNameOrPath : collectionNameOrPath;
 
         // Generate embedding vectors - run dense and sparse in parallel for speed
         const chunkContents = chunks.map(chunk => chunk.content);
@@ -996,7 +1066,7 @@ export class Context {
             });
 
             // Store to vector database
-            await this.vectorDatabase.insertHybrid(this.getCollectionName(codebasePath), documents);
+            await this.vectorDatabase.insertHybrid(collectionName, documents);
         } else {
             // Create regular vector documents
             const documents: VectorDocument[] = chunks.map((chunk, index) => {
@@ -1038,7 +1108,7 @@ export class Context {
             });
 
             // Store to vector database
-            await this.vectorDatabase.insert(this.getCollectionName(codebasePath), documents);
+            await this.vectorDatabase.insert(collectionName, documents);
         }
     }
 
@@ -1824,10 +1894,6 @@ export class Context {
             sha: options?.sha
         };
 
-        // Use the existing indexCodebase logic but with project context
-        // We'll need to modify the processChunkBatch calls to include project context
-        // For now, call the existing method and note that processChunkBatch signature has changed
-        
         const isHybrid = this.getIsHybrid();
         const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
         console.log(`[Context] 🚀 Starting to index codebase with ${searchType}: ${codebasePath}`);
@@ -1835,9 +1901,41 @@ export class Context {
         // 1. Load ignore patterns from various ignore files
         await this.loadIgnorePatterns(codebasePath);
 
-        // 2. Check and prepare vector collection
+        // 2. Get collection name using ScopeManager (Island Architecture)
+        const collectionName = this.scopeManager.getCollectionName(projectName, datasetName);
+        console.log(`[Context] 📦 Using collection: ${collectionName}`);
+
+        // 3. Create dataset_collections record if PostgreSQL is configured
+        console.log(`[Context] 🔍 DEBUG: postgresPool exists? ${!!this.postgresPool}`);
+        console.log(`[Context] 🔍 DEBUG: datasetId: ${projectContext.datasetId}`);
+        console.log(`[Context] 🔍 DEBUG: collectionName: ${collectionName}`);
+        
+        if (this.postgresPool) {
+            try {
+                const { getOrCreateCollectionRecord } = await import('./utils/collection-helpers');
+                const collectionId = await getOrCreateCollectionRecord(
+                    this.postgresPool,
+                    projectContext.datasetId,
+                    collectionName,
+                    this.vectorDatabase.constructor.name === 'QdrantVectorDatabase' ? 'qdrant' : 'postgres',
+                    await this.embedding.detectDimension(),
+                    isHybrid === true
+                );
+                console.log(`[Context] ✅ Collection record created/updated: ${collectionId}`);
+            } catch (error) {
+                console.error(`[Context] ❌ CRITICAL: Failed to create dataset_collections record:`, error);
+                console.error(`[Context] ❌ Dataset ID: ${projectContext.datasetId}, Collection: ${collectionName}`);
+                console.error(`[Context] ❌ This means the MCP tools will show 0 vectors!`);
+                // Don't throw - allow indexing to continue, but log prominently
+            }
+        } else {
+            console.warn(`[Context] ⚠️  PostgreSQL pool not configured - dataset_collections will not be created`);
+            console.warn(`[Context] ⚠️  This means the MCP tools will show 0 vectors!`);
+        }
+
+        // 4. Check and prepare vector collection with the scope-based name
         options?.progressCallback?.({ phase: 'Preparing collection...', current: 0, total: 100, percentage: 0 });
-        await this.prepareCollection(codebasePath, options?.forceReindex || false);
+        await this.prepareCollectionScoped(collectionName, options?.forceReindex || false);
 
         // 3. Recursively traverse codebase to get all supported files
         options?.progressCallback?.({ phase: 'Scanning files...', current: 5, total: 100, percentage: 5 });
@@ -1864,13 +1962,18 @@ export class Context {
         const batchQueue: Promise<void>[] = [];
 
         const processBatchAsync = async (chunks: CodeChunk[]) => {
-            await this.processChunkBatch(chunks, codebasePath, projectContext, provenance);
+            await this.processChunkBatch(chunks, collectionName, projectContext, provenance);
             totalChunks += chunks.length;
         };
 
         for (const filePath of codeFiles) {
             try {
-                const fileContent = await fs.promises.readFile(filePath, 'utf-8');
+                let fileContent = await fs.promises.readFile(filePath, 'utf-8');
+                
+                // Sanitize Unicode to prevent "lone leading surrogate" errors
+                // Replace invalid Unicode characters with replacement character
+                fileContent = fileContent.replace(/[\uD800-\uDFFF]/g, '\uFFFD');
+                
                 const language = this.getLanguageFromExtension(path.extname(filePath));
                 const chunks = await this.codeSplitter.split(fileContent, language, filePath);
 
@@ -1878,7 +1981,9 @@ export class Context {
                     const originalMetadata = chunk.metadata ?? {};
                     chunk.metadata = {
                         ...originalMetadata,
-                        filePath: originalMetadata.filePath || filePath,
+                        startLine: (originalMetadata as any).startLine ?? 1,
+                        endLine: (originalMetadata as any).endLine ?? fileContent.split('\n').length,
+                        filePath: (originalMetadata as any).filePath || filePath,
                         chunkIndex: chunkIdx
                     };
                 });
@@ -1934,6 +2039,12 @@ export class Context {
 
         // Wait for all remaining batches to complete
         await Promise.all(batchQueue);
+
+        // Update collection metadata with final point count
+        if (this.postgresPool) {
+            const { updateCollectionMetadata } = await import('./utils/collection-helpers');
+            await updateCollectionMetadata(this.postgresPool, collectionName, totalChunks);
+        }
 
         console.log(`[Context] ✅ Project-aware indexing completed! Processed ${processedFiles} files, generated ${totalChunks} chunks`);
         options?.progressCallback?.({ phase: 'Completed', current: 100, total: 100, percentage: 100 });

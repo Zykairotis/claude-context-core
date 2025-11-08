@@ -48,13 +48,13 @@ async def crawl_batch_with_progress(
                 logger.warning("Batch crawl failed for %s: %s", target_url, exc)
                 completed += 1
                 if progress_callback:
-                    progress_callback(completed, total, target_url)
+                    await progress_callback(completed, total, target_url)
                 return
 
             results.append(page)
             completed += 1
             if progress_callback:
-                progress_callback(completed, total, page.url)
+                await progress_callback(completed, total, page.url)
 
     tasks = [asyncio.create_task(crawl_single(url)) for url in urls]
 
