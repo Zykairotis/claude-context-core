@@ -1747,16 +1747,16 @@ async function main() {
   // Crawl4AI Service Tools
   mcpServer.registerTool(`${toolNamespace}.crawl`, {
     title: 'Crawl Web Pages',
-    description: 'Trigger crawl4ai service to crawl and index web pages. Modes: single (1 page), batch (multiple URLs), recursive (follow links), sitemap (parse sitemap.xml). Dataset auto-generated from domain (e.g., docs-example-com). Defaults: scope="project", mode="single", maxPages=50',
+    description: 'Trigger crawl4ai service to crawl and index web pages. Modes: single (1 page), batch (multiple URLs), recursive (follow links up to maxDepth, stays within same URL path), sitemap (parse sitemap.xml). Dataset auto-generated from domain (e.g., docs-example-com). Defaults: scope="project", mode="recursive", maxPages=0 (unlimited), maxDepth=2',
     inputSchema: {
       url: z.string().url().describe('URL to crawl'),
       project: z.string().optional().describe('Project name for storage isolation'),
       dataset: z.string().optional().describe('Dataset name (default: auto-generated from domain, e.g., "docs-example-com")'),
       scope: z.enum(['global', 'local', 'project']).optional().describe('Knowledge scope - global: shared across projects, local: local only, project: project-scoped (default: "project")'),
-      mode: z.enum(['single', 'batch', 'recursive', 'sitemap']).optional().describe('Crawling mode - single: one page, batch: multiple URLs, recursive: follow links, sitemap: parse sitemap.xml (default: "single")'),
-      maxPages: z.number().optional().describe('Maximum number of pages to crawl (default: 50)'),
-      maxDepth: z.number().optional().describe('Maximum depth for recursive crawling (default: 1)'),
-      autoDiscovery: z.boolean().optional().describe('Auto-discover llms.txt and sitemaps (default: true)'),
+      mode: z.enum(['single', 'batch', 'recursive', 'sitemap']).optional().describe('Crawling mode - single: one page, batch: multiple URLs, recursive: follow links (stays in same URL path), sitemap: parse sitemap.xml (default: "recursive")'),
+      maxPages: z.number().optional().describe('Maximum number of pages to crawl, 0 for unlimited (default: 0)'),
+      maxDepth: z.number().optional().describe('Maximum depth for recursive crawling (default: 2)'),
+      autoDiscovery: z.boolean().optional().describe('Auto-discover llms.txt and sitemaps (default: false)'),
       extractCode: z.boolean().optional().describe('Extract code examples (default: true)')
     }
   }, async ({ url, project, dataset, scope, mode, maxPages, maxDepth, autoDiscovery, extractCode }) => {
@@ -1767,20 +1767,22 @@ async function main() {
       const urlObj = new URL(url);
       const domainName = urlObj.hostname.replace(/^www\./, '').replace(/\./g, '-');
       
-      // Start crawl with better defaults
+      // Use project or default
+      const projectName = project || mcpDefaults.project || 'default';
+      const datasetName = dataset || domainName;  // Default to domain name (e.g., "docs-example-com")
+      
+      // Call API server endpoint (which handles all the proper mapping and new features)
       const crawlRequest = {
-        urls: [url],
-        project: project || mcpDefaults.project,
-        dataset: dataset || domainName,  // Default to domain name (e.g., "docs-example-com")
-        scope: scope || 'project',  // Default to "project"
-        mode: mode || 'single',
-        max_pages: maxPages || 50,
-        max_depth: maxDepth || 1,
-        auto_discovery: autoDiscovery !== false,
-        extract_code_examples: extractCode !== false
+        start_url: url,
+        crawl_type: mode || 'recursive',
+        max_pages: maxPages !== undefined ? maxPages : 0,  // Default to unlimited
+        depth: maxDepth !== undefined ? maxDepth : 2,
+        dataset: datasetName,
+        scope: scope || 'project'
       };
 
-      const startResponse = await fetch('http://localhost:7070/crawl', {
+      const apiServerUrl = `http://localhost:3030/projects/${projectName}/ingest/crawl`;
+      const startResponse = await fetch(apiServerUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(crawlRequest)
@@ -1790,30 +1792,33 @@ async function main() {
         throw new Error(`Crawl start failed: ${startResponse.statusText}`);
       }
 
-      const { progress_id, status } = await startResponse.json();
-
-      // Return immediately with progress_id - don't wait for completion
-      const projectName = project || mcpDefaults.project || 'default';
-      const datasetName = dataset || domainName;
-      const scopeName = scope || 'project';
+      const { jobId } = await startResponse.json();
+      
+      // Resolved values
+      const actualMode = mode || 'recursive';
+      const actualMaxPages = maxPages !== undefined ? maxPages : 0;
+      const actualMaxDepth = maxDepth !== undefined ? maxDepth : 2;
+      const actualScope = scope || 'project';
       
       return {
         content: [
           {
             type: 'text',
-            text: `✅ Crawl started successfully!\n\n📋 Details:\n  • Progress ID: ${progress_id}\n  • URL: ${url}\n  • Project: ${projectName}\n  • Dataset: ${datasetName}\n  • Scope: ${scopeName}\n  • Mode: ${mode || 'single'}\n  • Max Pages: ${maxPages || 50}\n\n🔍 Check progress with:\n  claudeContext.crawlStatus("${progress_id}")`
+            text: `✅ Crawl started successfully!\n\n📋 Details:\n  • Job ID: ${jobId}\n  • URL: ${url}\n  • Project: ${projectName}\n  • Dataset: ${datasetName}\n  • Scope: ${actualScope}\n  • Mode: ${actualMode}\n  • Max Pages: ${actualMaxPages === 0 ? 'Unlimited' : actualMaxPages}\n  • Max Depth: ${actualMaxDepth}\n  • Path Filtering: ✅ Enabled (stays within same URL path)\n\n🔍 Track progress:\n  claudeContext.status({ project: "${projectName}", dataset: "${datasetName}", showOperations: true })`
           }
         ],
         structuredContent: {
-          progress_id,
+          jobId,
           url,
           project: projectName,
           dataset: datasetName,
-          scope: scopeName,
-          mode: mode || 'single',
-          maxPages: maxPages || 50,
+          scope: actualScope,
+          mode: actualMode,
+          maxPages: actualMaxPages,
+          maxDepth: actualMaxDepth,
+          pathFiltering: true,
           status: 'started',
-          message: `Use claudeContext.crawlStatus("${progress_id}") to check progress`
+          message: `Use claudeContext.status to check progress`
         }
       };
 
