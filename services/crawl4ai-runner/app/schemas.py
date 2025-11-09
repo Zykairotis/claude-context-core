@@ -28,6 +28,7 @@ class CrawlRequest(BaseModel):
     max_depth: Optional[NonNegativeInt] = Field(1, description="Maximum depth for recursive crawling")
     max_pages: Optional[int] = Field(20, ge=0, description="Maximum pages to fetch (0 for unlimited)")
     same_domain_only: bool = Field(True, description="Restrict recursive crawling to the seed domain")
+    same_path_prefix: bool = Field(False, description="Restrict recursive crawling to same URL path prefix (e.g., /docs/agent-sdk/)")
     include_links: bool = Field(False, description="Return discovered links from each page")
     auto_discovery: bool = Field(True, description="Auto-discover llms.txt and sitemaps")
     max_concurrent: Optional[NonNegativeInt] = Field(None, description="Maximum concurrent fetches")

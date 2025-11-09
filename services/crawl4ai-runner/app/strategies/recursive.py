@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 from typing import Iterable, List, Optional, Set
-from urllib.parse import urldefrag
+from urllib.parse import urldefrag, urlparse
 
 try:
     from crawl4ai import CacheMode, CrawlerRunConfig, MemoryAdaptiveDispatcher
@@ -26,6 +26,7 @@ async def crawl_recursive_with_progress(
     max_depth: int = 2,
     max_pages: int = 50,
     same_domain_only: bool = True,
+    same_path_prefix: bool = False,
     include_links: bool = True,
     progress_callback=None,
     cancel_event: Optional[asyncio.Event] = None,
@@ -59,7 +60,19 @@ async def crawl_recursive_with_progress(
     # Start with normalized seed URLs
     current_urls = {normalize(url) for url in seed_urls}
     total_discovered = len(current_urls)
-    seed_domains = {normalize(url).split("//", 1)[-1].split("/", 1)[0] for url in seed_urls}
+    
+    # Build set of seed domains for same-domain filtering
+    seed_domains = {url.split("//", 1)[-1].split("/", 1)[0] for url in current_urls}
+    
+    # Build set of path prefixes for same-path filtering
+    seed_path_prefixes = set()
+    if same_path_prefix:
+        for url in current_urls:
+            # Extract path from URL (e.g., https://docs.claude.com/en/docs/agent-sdk/ -> /en/docs/agent-sdk/)
+            parsed = urlparse(url)
+            path = parsed.path.rstrip('/')  # Remove trailing slash
+            if path:
+                seed_path_prefixes.add(path)
     
     # Setup memory-adaptive dispatcher if available
     dispatcher = None
@@ -210,6 +223,14 @@ async def crawl_recursive_with_progress(
                             if same_domain_only:
                                 domain = next_url.split("//", 1)[-1].split("/", 1)[0]
                                 if domain not in seed_domains:
+                                    continue
+                            
+                            # Apply same-path-prefix filter if enabled
+                            if same_path_prefix and seed_path_prefixes:
+                                parsed = urlparse(next_url)
+                                link_path = parsed.path.rstrip('/')
+                                # Check if link path starts with any of the seed path prefixes
+                                if not any(link_path.startswith(prefix) for prefix in seed_path_prefixes):
                                     continue
                             
                             # Add to next level

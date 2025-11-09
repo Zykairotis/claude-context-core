@@ -56,6 +56,7 @@ async def crawl(request: CrawlRequest) -> CrawlStartResponse:
         max_depth=request.max_depth or 1,
         max_pages=request.max_pages if request.max_pages is not None else 20,
         same_domain_only=request.same_domain_only,
+        same_path_prefix=request.same_path_prefix,
         include_links=request.include_links,
         extract_code_examples=request.extract_code_examples,
         knowledge_type=request.knowledge_type,

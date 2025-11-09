@@ -96,6 +96,7 @@ class CrawlRequestContext:
     max_depth: int
     max_pages: int
     same_domain_only: bool
+    same_path_prefix: bool
     include_links: bool
     extract_code_examples: bool
     knowledge_type: Optional[str]
@@ -480,6 +481,7 @@ class CrawlingService:
                 max_depth=ctx.max_depth,
                 max_pages=ctx.max_pages,
                 same_domain_only=ctx.same_domain_only,
+                same_path_prefix=ctx.same_path_prefix,
                 include_links=ctx.include_links,
                 progress_callback=progress_callback,
                 cancel_event=cancel_event,
@@ -507,6 +509,7 @@ class CrawlingService:
                 max_depth=ctx.max_depth - 1,
                 max_pages=ctx.max_pages,
                 same_domain_only=ctx.same_domain_only,
+                same_path_prefix=ctx.same_path_prefix,
                 include_links=ctx.include_links,
                 max_concurrent=ctx.max_concurrent,  # Pass through max_concurrent
                 progress_callback=progress_callback,
