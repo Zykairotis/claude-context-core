@@ -603,7 +603,7 @@ export function createProjectsRouter(pool: Pool, crawlMonitor: CrawlMonitor, wsM
               scope: scope || 'project',
               same_domain_only: true,
               same_path_prefix: true,  // Keep crawling within same URL path (e.g., /docs/agent-sdk/)
-              include_links: crawl_type === 'recursive',  // Enable link extraction for recursive mode
+              include_links: true,  // Enable link extraction by default
               auto_discovery: false,  // Disable to crawl exact URLs without sitemap redirects
               extract_code_examples: true
             }),
